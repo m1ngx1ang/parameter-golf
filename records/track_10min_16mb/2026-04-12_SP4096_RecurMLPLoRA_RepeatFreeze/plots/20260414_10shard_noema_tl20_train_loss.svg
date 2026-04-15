@@ -1,0 +1,117 @@
+<svg xmlns='http://www.w3.org/2000/svg' width='980' height='620' viewBox='0 0 980 620'>
+<rect width='100%' height='100%' fill='#ffffff'/>
+<style>
+text{font-family:Arial,Helvetica,sans-serif; fill:#1f2937}
+.small{font-size:12px}
+.axis{font-size:13px; font-weight:600}
+.title{font-size:22px; font-weight:700}
+.subtitle{font-size:13px; fill:#4b5563}
+.grid{stroke:#e5e7eb; stroke-width:1}
+.frame{stroke:#111827; stroke-width:1.5; fill:none}
+</style>
+<text x='90' y='32' class='title'>10-Shard Train Loss Curves</text>
+<text x='90' y='52' class='subtitle'>TRAIN_LOG_EVERY=20, EMA_DECAY=0.0, 200 steps, batch tokens=8192</text>
+<line x1='90' y1='550.00' x2='950' y2='550.00' class='grid'/>
+<text x='78' y='554.00' text-anchor='end' class='small'>4.5</text>
+<line x1='90' y1='481.43' x2='950' y2='481.43' class='grid'/>
+<text x='78' y='485.43' text-anchor='end' class='small'>6.0</text>
+<line x1='90' y1='412.86' x2='950' y2='412.86' class='grid'/>
+<text x='78' y='416.86' text-anchor='end' class='small'>7.5</text>
+<line x1='90' y1='344.29' x2='950' y2='344.29' class='grid'/>
+<text x='78' y='348.29' text-anchor='end' class='small'>9.0</text>
+<line x1='90' y1='275.71' x2='950' y2='275.71' class='grid'/>
+<text x='78' y='279.71' text-anchor='end' class='small'>10.5</text>
+<line x1='90' y1='207.14' x2='950' y2='207.14' class='grid'/>
+<text x='78' y='211.14' text-anchor='end' class='small'>12.0</text>
+<line x1='90' y1='138.57' x2='950' y2='138.57' class='grid'/>
+<text x='78' y='142.57' text-anchor='end' class='small'>13.5</text>
+<line x1='90' y1='70.00' x2='950' y2='70.00' class='grid'/>
+<text x='78' y='74.00' text-anchor='end' class='small'>15.0</text>
+<line x1='90.00' y1='70' x2='90.00' y2='550' class='grid'/>
+<text x='90.00' y='572' text-anchor='middle' class='small'>1</text>
+<line x1='172.11' y1='70' x2='172.11' y2='550' class='grid'/>
+<text x='172.11' y='572' text-anchor='middle' class='small'>20</text>
+<line x1='258.54' y1='70' x2='258.54' y2='550' class='grid'/>
+<text x='258.54' y='572' text-anchor='middle' class='small'>40</text>
+<line x1='344.97' y1='70' x2='344.97' y2='550' class='grid'/>
+<text x='344.97' y='572' text-anchor='middle' class='small'>60</text>
+<line x1='431.41' y1='70' x2='431.41' y2='550' class='grid'/>
+<text x='431.41' y='572' text-anchor='middle' class='small'>80</text>
+<line x1='517.84' y1='70' x2='517.84' y2='550' class='grid'/>
+<text x='517.84' y='572' text-anchor='middle' class='small'>100</text>
+<line x1='604.27' y1='70' x2='604.27' y2='550' class='grid'/>
+<text x='604.27' y='572' text-anchor='middle' class='small'>120</text>
+<line x1='690.70' y1='70' x2='690.70' y2='550' class='grid'/>
+<text x='690.70' y='572' text-anchor='middle' class='small'>140</text>
+<line x1='777.14' y1='70' x2='777.14' y2='550' class='grid'/>
+<text x='777.14' y='572' text-anchor='middle' class='small'>160</text>
+<line x1='863.57' y1='70' x2='863.57' y2='550' class='grid'/>
+<text x='863.57' y='572' text-anchor='middle' class='small'>180</text>
+<line x1='950.00' y1='70' x2='950.00' y2='550' class='grid'/>
+<text x='950.00' y='572' text-anchor='middle' class='small'>200</text>
+<line x1='388.19' y1='70' x2='388.19' y2='550' stroke='#6b7280' stroke-width='1.5' stroke-dasharray='6 5'/>
+<text x='394.19' y='86' class='small' fill='#6b7280'>Loop on</text>
+<line x1='517.84' y1='70' x2='517.84' y2='550' stroke='#9c27b0' stroke-width='1.5' stroke-dasharray='6 5'/>
+<text x='523.84' y='86' class='small' fill='#9c27b0'>LoRA on</text>
+<rect x='90' y='70' width='860' height='480' class='frame'/>
+<polyline fill='none' stroke='#1565c0' stroke-width='3' points='90.00,375.68 94.32,91.48 98.64,80.93 102.96,119.27 107.29,168.06 172.11,444.83 258.54,493.93 344.97,507.56 431.41,504.63 517.84,516.01 604.27,521.12 690.70,524.00 777.14,525.66 863.57,532.07 950.00,538.48'/>
+<circle cx='90.00' cy='375.68' r='3.2' fill='#1565c0'/>
+<circle cx='94.32' cy='91.48' r='3.2' fill='#1565c0'/>
+<circle cx='98.64' cy='80.93' r='3.2' fill='#1565c0'/>
+<circle cx='102.96' cy='119.27' r='3.2' fill='#1565c0'/>
+<circle cx='107.29' cy='168.06' r='3.2' fill='#1565c0'/>
+<circle cx='172.11' cy='444.83' r='3.2' fill='#1565c0'/>
+<circle cx='258.54' cy='493.93' r='3.2' fill='#1565c0'/>
+<circle cx='344.97' cy='507.56' r='3.2' fill='#1565c0'/>
+<circle cx='431.41' cy='504.63' r='3.2' fill='#1565c0'/>
+<circle cx='517.84' cy='516.01' r='3.2' fill='#1565c0'/>
+<circle cx='604.27' cy='521.12' r='3.2' fill='#1565c0'/>
+<circle cx='690.70' cy='524.00' r='3.2' fill='#1565c0'/>
+<circle cx='777.14' cy='525.66' r='3.2' fill='#1565c0'/>
+<circle cx='863.57' cy='532.07' r='3.2' fill='#1565c0'/>
+<circle cx='950.00' cy='538.48' r='3.2' fill='#1565c0'/>
+<polyline fill='none' stroke='#c62828' stroke-width='3' points='90.00,375.66 94.32,90.26 98.64,79.90 102.96,119.97 107.29,171.15 172.11,445.54 258.54,494.39 344.97,508.52 431.41,504.07 517.84,515.99 604.27,521.04 690.70,524.00 777.14,525.11 863.57,532.27 950.00,538.08'/>
+<circle cx='90.00' cy='375.66' r='3.2' fill='#c62828'/>
+<circle cx='94.32' cy='90.26' r='3.2' fill='#c62828'/>
+<circle cx='98.64' cy='79.90' r='3.2' fill='#c62828'/>
+<circle cx='102.96' cy='119.97' r='3.2' fill='#c62828'/>
+<circle cx='107.29' cy='171.15' r='3.2' fill='#c62828'/>
+<circle cx='172.11' cy='445.54' r='3.2' fill='#c62828'/>
+<circle cx='258.54' cy='494.39' r='3.2' fill='#c62828'/>
+<circle cx='344.97' cy='508.52' r='3.2' fill='#c62828'/>
+<circle cx='431.41' cy='504.07' r='3.2' fill='#c62828'/>
+<circle cx='517.84' cy='515.99' r='3.2' fill='#c62828'/>
+<circle cx='604.27' cy='521.04' r='3.2' fill='#c62828'/>
+<circle cx='690.70' cy='524.00' r='3.2' fill='#c62828'/>
+<circle cx='777.14' cy='525.11' r='3.2' fill='#c62828'/>
+<circle cx='863.57' cy='532.27' r='3.2' fill='#c62828'/>
+<circle cx='950.00' cy='538.08' r='3.2' fill='#c62828'/>
+<polyline fill='none' stroke='#2e7d32' stroke-width='3' points='90.00,375.49 94.32,90.53 98.64,78.71 102.96,119.71 107.29,170.94 172.11,446.27 258.54,496.68 344.97,509.04 431.41,504.94 517.84,516.67 604.27,521.83 690.70,524.06 777.14,525.79 863.57,532.64 950.00,538.64'/>
+<circle cx='90.00' cy='375.49' r='3.2' fill='#2e7d32'/>
+<circle cx='94.32' cy='90.53' r='3.2' fill='#2e7d32'/>
+<circle cx='98.64' cy='78.71' r='3.2' fill='#2e7d32'/>
+<circle cx='102.96' cy='119.71' r='3.2' fill='#2e7d32'/>
+<circle cx='107.29' cy='170.94' r='3.2' fill='#2e7d32'/>
+<circle cx='172.11' cy='446.27' r='3.2' fill='#2e7d32'/>
+<circle cx='258.54' cy='496.68' r='3.2' fill='#2e7d32'/>
+<circle cx='344.97' cy='509.04' r='3.2' fill='#2e7d32'/>
+<circle cx='431.41' cy='504.94' r='3.2' fill='#2e7d32'/>
+<circle cx='517.84' cy='516.67' r='3.2' fill='#2e7d32'/>
+<circle cx='604.27' cy='521.83' r='3.2' fill='#2e7d32'/>
+<circle cx='690.70' cy='524.06' r='3.2' fill='#2e7d32'/>
+<circle cx='777.14' cy='525.79' r='3.2' fill='#2e7d32'/>
+<circle cx='863.57' cy='532.64' r='3.2' fill='#2e7d32'/>
+<circle cx='950.00' cy='538.64' r='3.2' fill='#2e7d32'/>
+<rect x='746' y='70' width='190' height='76' fill='#ffffff' stroke='#d1d5db'/>
+<line x1='760' y1='88' x2='788' y2='88' stroke='#1565c0' stroke-width='3'/>
+<circle cx='774' cy='88' r='3.2' fill='#1565c0'/>
+<text x='798' y='92' class='small'>No LoRA</text>
+<line x1='760' y1='110' x2='788' y2='110' stroke='#c62828' stroke-width='3'/>
+<circle cx='774' cy='110' r='3.2' fill='#c62828'/>
+<text x='798' y='114' class='small'>LoRA r=2</text>
+<line x1='760' y1='132' x2='788' y2='132' stroke='#2e7d32' stroke-width='3'/>
+<circle cx='774' cy='132' r='3.2' fill='#2e7d32'/>
+<text x='798' y='136' class='small'>LoRA r=8</text>
+<text x='520.00' y='600' text-anchor='middle' class='axis'>Training Step</text>
+<text x='24' y='310.00' text-anchor='middle' class='axis' transform='rotate(-90 24 310.00)'>Train Loss</text>
+</svg>
