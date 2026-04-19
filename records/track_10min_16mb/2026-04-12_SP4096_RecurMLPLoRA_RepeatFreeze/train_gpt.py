@@ -895,7 +895,8 @@ def gptq_mixed_quantize(state_dict, hessians, h):
         categories[cat].add(short)
     log("Quantized weights:")
     for cat in sorted(categories):
-        log(f"  {cat}: {", ".join(sorted(categories[cat]))}")
+        names = ", ".join(sorted(categories[cat]))
+        log(f"  {cat}: {names}")
     return result, meta
 
 
