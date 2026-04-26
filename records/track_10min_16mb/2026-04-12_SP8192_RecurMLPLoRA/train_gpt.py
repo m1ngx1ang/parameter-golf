@@ -58,6 +58,7 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 6e2))
     val_batch_tokens = int(os.environ.get("VAL_BATCH_TOKENS", 524288))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
+    val_max_tokens = int(os.environ.get("VAL_MAX_TOKENS", 0))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 4000))
     sliding_window_enabled = bool(int(os.environ.get("SLIDING_WINDOW_ENABLED", "1")))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
@@ -1264,7 +1265,14 @@ def eval_val(h, device, val_data, model):
             f"VAL_BATCH_TOKENS must provide at least one sequence per rank; got VAL_BATCH_TOKENS={h.val_batch_tokens}, WORLD_SIZE={h.world_size}, GRAD_ACCUM_STEPS={h.grad_accum_steps}, seq_len={seq_len}"
         )
     local_batch_seqs = local_batch_tokens // seq_len
-    total_seqs = (val_data.val_tokens.numel() - 1) // seq_len
+    total_tokens = val_data.val_tokens.numel() - 1
+    if h.val_max_tokens > 0:
+        total_tokens = min(total_tokens, h.val_max_tokens)
+    total_seqs = total_tokens // seq_len
+    if total_seqs < 1:
+        raise ValueError(
+            f"VAL_MAX_TOKENS must cover at least one eval sequence; got VAL_MAX_TOKENS={h.val_max_tokens}, EVAL_SEQ_LEN={seq_len}"
+        )
     seq_start = total_seqs * h.rank // h.world_size
     seq_end = total_seqs * (h.rank + 1) // h.world_size
     val_loss_sum, val_token_count, val_byte_count = _zero_accumulators(device)
