@@ -60,7 +60,7 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 4000))
     sliding_window_enabled = bool(int(os.environ.get("SLIDING_WINDOW_ENABLED", "1")))
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 4096))
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
