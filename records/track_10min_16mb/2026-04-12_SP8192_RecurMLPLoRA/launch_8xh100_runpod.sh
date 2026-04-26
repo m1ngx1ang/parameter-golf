@@ -25,9 +25,15 @@ RUNPOD_SSH_PUBLIC_KEY="${RUNPOD_SSH_PUBLIC_KEY:-${RUNPOD_SSH_PRIVATE_KEY}.pub}"
 WAIT_FOR_REMOTE_SECONDS="${WAIT_FOR_REMOTE_SECONDS:-300}"
 WAIT_FOR_REMOTE_POLL_SECONDS="${WAIT_FOR_REMOTE_POLL_SECONDS:-5}"
 
-remote_url="$(git config --get remote.origin.url || true)"
+upstream_ref="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+upstream_remote="${upstream_ref%%/*}"
+if [[ -z "${upstream_ref}" || "${upstream_remote}" == "${upstream_ref}" ]]; then
+  upstream_remote="origin"
+fi
+repo_remote="${REPO_REMOTE:-${upstream_remote}}"
+remote_url="$(git config --get "remote.${repo_remote}.url" || true)"
 if [[ -z "${remote_url}" ]]; then
-  echo "No git remote.origin.url found. Set REPO_URL=https://github.com/<you>/parameter-golf.git" >&2
+  echo "No git remote.${repo_remote}.url found. Set REPO_URL=https://github.com/<you>/parameter-golf.git" >&2
   exit 1
 fi
 if [[ "${remote_url}" =~ ^git@github.com:(.*)\.git$ ]]; then
