@@ -23,6 +23,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 FLASH_ATTN_BACKEND = "flash_attn_3"
 FLASH_ATTN_IMPORT_ERROR = None
+PASSTHROUGH_TENSOR_MAX_NUMEL = 65536
 try:
     from flash_attn_interface import flash_attn_func as flash_attn_3_func
 except ImportError as exc:
@@ -61,7 +62,6 @@ class Hyperparameters:
     sliding_window_enabled = bool(int(os.environ.get("SLIDING_WINDOW_ENABLED", "1")))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 4096))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
-    xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     embedding_dim = int(os.environ.get("EMBEDDING_DIM", 512))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
@@ -74,6 +74,8 @@ class Hyperparameters:
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     rope_train_seq_len = int(os.environ.get("ROPE_TRAIN_SEQ_LEN", 2048))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
+    stable_resid_mix = bool(int(os.environ.get("STABLE_RESID_MIX", "1")))
+    stable_resid_carry_init = float(os.environ.get("STABLE_RESID_CARRY_INIT", 0.99))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.25))
     num_loops = int(os.environ.get("NUM_LOOPS", 2))
     loop_start = int(os.environ.get("LOOP_START", 3))
@@ -84,8 +86,7 @@ class Hyperparameters:
     mlp_lora_lr = float(os.environ.get("MLP_LORA_LR", 0.04))
     mlp_lora_wd = float(os.environ.get("MLP_LORA_WD", 0.0))
     mlp_lora_layers = os.environ.get("MLP_LORA_LAYERS", "").strip()
-    enable_mlp_lora_at = float(os.environ.get("ENABLE_MLP_LORA_AT", 0.50))
-    freeze_repeated_mlp = bool(int(os.environ.get("FREEZE_REPEATED_MLP", "1")))
+    enable_mlp_lora_at = float(os.environ.get("ENABLE_MLP_LORA_AT", os.environ.get("ENABLE_LOOPING_AT", 0.35)))
     parallel_residual_start = int(os.environ.get("PARALLEL_RESIDUAL_START", 7))
     min_lr = float(os.environ.get("MIN_LR", 0.0))
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -236,7 +237,6 @@ def load_data_shard(file):
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
-_SHARD_HEADER_BYTES = 256 * np.dtype("<i4").itemsize
 _SHARD_NTOKENS_CACHE = {}
 _MMAP_CACHE = {}
 
@@ -260,7 +260,7 @@ def _get_shard_memmap(file):
     if mm is not None:
         return mm
     n = _read_num_tokens(file)
-    mm = np.memmap(file, mode="r", dtype="<u2", offset=_SHARD_HEADER_BYTES, shape=(n,))
+    mm = np.memmap(file, mode="r", dtype="<u2", offset=256 * np.dtype("<i4").itemsize, shape=(n,))
     _MMAP_CACHE[key] = mm
     return mm
 
@@ -412,7 +412,7 @@ class CausalSelfAttention(nn.Module):
         )
         self.rope_dims = 0
         self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=train_seq_len)
-        self.use_xsa = False
+        self.use_xsa = True
 
     def _xsa_efficient(self, y, v):
         B, T, H, D = y.shape
@@ -450,22 +450,15 @@ class MLP(nn.Module):
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
-    def forward(self, x, lora=None, lora_enabled=False, freeze_base=False):
-        if freeze_base:
-            hidden = F.leaky_relu(
-                F.linear(x, self.fc.weight.detach().to(x.dtype)), negative_slope=0.5
-            ).square()
-            out = F.linear(hidden, self.proj.weight.detach().to(hidden.dtype))
-        else:
-            # Use the modules directly so Hessian hooks on CastedLinear still fire.
-            hidden = F.leaky_relu(self.fc(x), negative_slope=0.5).square()
-            out = self.proj(hidden)
+    def forward(self, x, lora=None, lora_enabled=False):
+        hidden = F.leaky_relu(self.fc(x), negative_slope=0.5).square()
+        out = self.proj(hidden)
         if lora is not None:
             out = out + lora(hidden, enabled=lora_enabled)
         return out
 
 
-class RepeatedPassMLPLoRA(nn.Module):
+class LoRAAdapter(nn.Module):
     def __init__(self, hidden_dim, model_dim, rank, alpha=1.0):
         super().__init__()
         self.rank = rank
@@ -499,6 +492,8 @@ class Block(nn.Module):
         train_seq_len,
         layer_idx=0,
         ln_scale=False,
+        stable_resid_mix=True,
+        stable_resid_carry_init=0.99,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -509,23 +504,33 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(
-            torch.stack((torch.ones(dim), torch.zeros(dim))).float()
-        )
+        self.stable_resid_mix = stable_resid_mix
+        if stable_resid_mix:
+            carry_init = min(max(stable_resid_carry_init, 1e-4), 1.0 - 1e-4)
+            raw_carry_init = math.log(-math.log(carry_init))
+            self.resid_carry_log = nn.Parameter(
+                torch.full((dim,), raw_carry_init, dtype=torch.float32)
+            )
+            self.resid_input_scale = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+        else:
+            self.resid_mix = nn.Parameter(
+                torch.stack((torch.ones(dim), torch.zeros(dim))).float()
+            )
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
         self.parallel = False
 
-    def forward(
-        self, x, x0, mlp_lora=None, mlp_lora_enabled=False, freeze_mlp_base=False
-    ):
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+    def forward(self, x, x0, mlp_lora=None, mlp_lora_enabled=False):
+        if self.stable_resid_mix:
+            carry = torch.exp(-torch.exp(self.resid_carry_log.clamp(-20, 20))).to(dtype=x.dtype)
+            input_scale = self.resid_input_scale.to(dtype=x.dtype)
+            x_in = carry[None, None, :] * x + input_scale[None, None, :] * x0
+        else:
+            mix = self.resid_mix.to(dtype=x.dtype)
+            x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor)
         attn_s = self.attn_scale.to(dtype=x_in.dtype)[None, None, :]
         mlp_s = self.mlp_scale.to(dtype=x_in.dtype)[None, None, :]
-        mlp_kw = dict(
-            lora=mlp_lora, lora_enabled=mlp_lora_enabled, freeze_base=freeze_mlp_base
-        )
+        mlp_kw = dict(lora=mlp_lora, lora_enabled=mlp_lora_enabled)
         if self.parallel:
             mlp_in = self.mlp_norm(x_in) * self.ln_scale_factor
             return x_in + attn_s * attn_out + mlp_s * self.mlp(mlp_in, **mlp_kw)
@@ -543,7 +548,6 @@ class GPT(nn.Module):
         self.tied_embed_init_std = h.tied_embed_init_std
         self.logit_softcap = h.logit_softcap
         self.tok_emb = nn.Embedding(h.vocab_size, h.embedding_dim)
-        self.freeze_repeated_mlp = h.freeze_repeated_mlp
         if h.embedding_dim != h.model_dim:
             self.embed_proj = CastedLinear(h.embedding_dim, h.model_dim, bias=False)
             self.head_proj = CastedLinear(h.model_dim, h.embedding_dim, bias=False)
@@ -564,6 +568,8 @@ class GPT(nn.Module):
                     h.train_seq_len,
                     layer_idx=i,
                     ln_scale=h.ln_scale,
+                    stable_resid_mix=h.stable_resid_mix,
+                    stable_resid_carry_init=h.stable_resid_carry_init,
                 )
                 for i in range(h.num_layers)
             ]
@@ -586,9 +592,6 @@ class GPT(nn.Module):
         )
         if self.lm_head is not None:
             self.lm_head._zero_init = True
-        if h.xsa_last_n > 0:
-            for i in range(max(0, h.num_layers - h.xsa_last_n), h.num_layers):
-                self.blocks[i].attn.use_xsa = True
         if h.parallel_residual_start >= 0:
             for i in range(h.parallel_residual_start, h.num_layers):
                 self.blocks[i].parallel = True
@@ -625,9 +628,9 @@ class GPT(nn.Module):
             (p, len(self.encoder_indices) + v)
             for (v, p) in enumerate(self.decoder_indices)
         ]
-        self.plain_encoder_plan = [(i, None) for i in range(self.num_encoder_layers)]
+        self.plain_encoder_plan = [(p, None) for p in range(self.num_encoder_layers)]
         self.plain_decoder_plan = [
-            (i, None) for i in range(self.num_encoder_layers, h.num_layers)
+            (p, None) for p in range(self.num_encoder_layers, h.num_layers)
         ]
         requested_lora_layers = parse_layer_list(h.mlp_lora_layers)
         default_lora_layers = (
@@ -635,7 +638,17 @@ class GPT(nn.Module):
         )
         self.mlp_lora_layers = sorted(set(requested_lora_layers or default_lora_layers))
         hidden_dim = int(h.mlp_mult * h.model_dim)
-        self.repeated_pass_mlp_loras = nn.ModuleList()
+        max_sparse_lora_rank = min(
+            PASSTHROUGH_TENSOR_MAX_NUMEL // hidden_dim,
+            PASSTHROUGH_TENSOR_MAX_NUMEL // h.model_dim,
+        )
+        self.mlp_lora_rank = min(h.mlp_lora_rank, max_sparse_lora_rank)
+        if h.mlp_lora_rank > self.mlp_lora_rank:
+            log(
+                f"mlp_lora:rank clipped from {h.mlp_lora_rank} to {self.mlp_lora_rank} "
+                f"to keep adapter tensors <= {PASSTHROUGH_TENSOR_MAX_NUMEL} params"
+            )
+        self.recurrent_mlp_loras = nn.ModuleList()
         self.virtual_mlp_lora_indices = []
         occurrences = collections.defaultdict(int)
         for virtual_idx, physical_idx in enumerate(
@@ -646,13 +659,13 @@ class GPT(nn.Module):
             if (
                 h.num_loops > 0
                 and is_repeated
-                and h.mlp_lora_rank > 0
+                and self.mlp_lora_rank > 0
                 and physical_idx in self.mlp_lora_layers
             ):
-                self.virtual_mlp_lora_indices.append(len(self.repeated_pass_mlp_loras))
-                self.repeated_pass_mlp_loras.append(
-                    RepeatedPassMLPLoRA(
-                        hidden_dim, h.model_dim, h.mlp_lora_rank, h.mlp_lora_alpha
+                self.virtual_mlp_lora_indices.append(len(self.recurrent_mlp_loras))
+                self.recurrent_mlp_loras.append(
+                    LoRAAdapter(
+                        hidden_dim, h.model_dim, self.mlp_lora_rank, h.mlp_lora_alpha
                     )
                 )
             else:
@@ -683,9 +696,8 @@ class GPT(nn.Module):
         return self.blocks[i](
             x,
             x0,
-            mlp_lora=self.repeated_pass_mlp_loras[lora_idx],
+            mlp_lora=self.recurrent_mlp_loras[lora_idx],
             mlp_lora_enabled=self.mlp_lora_active,
-            freeze_mlp_base=self.freeze_repeated_mlp and self.mlp_lora_active,
         )
 
     def forward_logits(self, input_ids):
@@ -714,13 +726,13 @@ class GPT(nn.Module):
                     g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[
                         None, None, :
                     ]
-                    x = torch.lerp(scaled_skip, x, g)
+                    x = torch.lerp(scaled_skip, x, g) * 2.0
                 else:
                     x = x + scaled_skip
             x = self._run_block(i, x, x0, virtual_idx)
-        if not self.looping_active and self.repeated_pass_mlp_loras:
+        if not self.looping_active and self.recurrent_mlp_loras:
             dummy = torch.zeros((), device=x.device, dtype=x.dtype)
-            for adapter in self.repeated_pass_mlp_loras:
+            for adapter in self.recurrent_mlp_loras:
                 dummy = dummy + adapter.zero_proxy().to(dtype=x.dtype, device=x.device)
             x = x + dummy
         x = self.final_norm(x)
@@ -744,7 +756,7 @@ class GPT(nn.Module):
 def classify_param(name):
     if "tok_emb" in name or "lm_head" in name:
         return "embed"
-    if name.startswith("repeated_pass_mlp_loras") or ".mlp." in name:
+    if name.startswith("recurrent_mlp_loras") or ".mlp." in name:
         return "mlp"
     if ".attn." in name or ".proj." in name:
         return "attn"
@@ -847,7 +859,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     p
     for p in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,mlp_scale,resid_mix,q_gain,skip_weight,skip_gates",
+        "attn_scale,mlp_scale,resid_mix,resid_carry_log,resid_input_scale,q_gain,skip_weight,skip_gates",
     ).split(",")
     if p
 )
@@ -900,7 +912,7 @@ class Optimizers:
             self.optimizer_muon,
             self.optimizer_scalar,
         ]
-        lora_params = list(base_model.repeated_pass_mlp_loras.parameters())
+        lora_params = list(base_model.recurrent_mlp_loras.parameters())
         if lora_params:
             self.optimizer_lora = torch.optim.AdamW(
                 [
@@ -953,7 +965,7 @@ def restore_fp32_params(model):
             p in name for p in CONTROL_TENSOR_NAME_PATTERNS
         )
         if (
-            is_control or name.startswith("repeated_pass_mlp_loras")
+            is_control or name.startswith("recurrent_mlp_loras")
         ) and param.dtype != torch.float32:
             param.data = param.data.float()
 
@@ -976,7 +988,10 @@ def collect_hessians(model, train_loader, h, device, n_calibration_batches=64):
         return lambda module, inp, out: _accumulate(name, inp[0])
 
     for name, module in model.named_modules():
-        if isinstance(module, CastedLinear) and module.weight.numel() > 65536:
+        if (
+            isinstance(module, CastedLinear)
+            and module.weight.numel() > PASSTHROUGH_TENSOR_MAX_NUMEL
+        ):
             if classify_param(name + ".weight") in ("mlp", "attn"):
                 hooks.append(module.register_forward_hook(make_hook(name + ".weight")))
     if model.tie_embeddings:
@@ -1044,14 +1059,14 @@ def gptq_mixed_quantize(state_dict, hessians, h):
     quantizable = [
         name
         for name, tensor in state_dict.items()
-        if tensor.is_floating_point() and tensor.numel() > 65536
+        if tensor.is_floating_point() and tensor.numel() > PASSTHROUGH_TENSOR_MAX_NUMEL
     ]
     quant_idx = 0
     if quantizable:
         log(f"GPTQ:quantizing {len(quantizable)} tensors on CPU")
     for name, tensor in state_dict.items():
         t = tensor.detach().cpu().contiguous()
-        if not t.is_floating_point() or t.numel() <= 65536:
+        if not t.is_floating_point() or t.numel() <= PASSTHROUGH_TENSOR_MAX_NUMEL:
             result[name] = t.to(torch.float16) if t.is_floating_point() else t
             meta[name] = "passthrough (float16)"
             continue
@@ -1481,7 +1496,10 @@ def train_model(h, device, val_data):
         model = compiled_model
     log(f"model_params:{sum(p.numel() for p in base_model.parameters())}")
     log(
-        f"repeated_pass_mlp_lora: rank={h.mlp_lora_rank} alpha={h.mlp_lora_alpha} layers={base_model.mlp_lora_layers} adapters={len(base_model.repeated_pass_mlp_loras)} freeze_base={int(h.freeze_repeated_mlp)} enable_at={h.enable_mlp_lora_at:.2f}"
+        f"stable_resid_mix:{int(h.stable_resid_mix)} carry_init:{h.stable_resid_carry_init:.4f}"
+    )
+    log(
+        f"repeated_pass_mlp_lora: rank={base_model.mlp_lora_rank} requested_rank={h.mlp_lora_rank} alpha={h.mlp_lora_alpha} layers={base_model.mlp_lora_layers} adapters={len(base_model.recurrent_mlp_loras)} enable_at={h.enable_mlp_lora_at:.2f}"
     )
     optimizers = Optimizers(h, base_model)
     train_loader = ShuffledSequenceLoader(h, device)
@@ -1615,13 +1633,13 @@ def train_model(h, device, val_data):
                 f"layer_loop:enabled step:{step} frac:{frac:.3f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}"
             )
         if (
-            base_model.repeated_pass_mlp_loras
+            base_model.recurrent_mlp_loras
             and not base_model.mlp_lora_active
             and frac >= h.enable_mlp_lora_at
         ):
             base_model.mlp_lora_active = True
             log(
-                f"mlp_lora:enabled step:{step} frac:{frac:.3f} adapters:{len(base_model.repeated_pass_mlp_loras)}"
+                f"mlp_lora:enabled step:{step} frac:{frac:.3f} adapters:{len(base_model.recurrent_mlp_loras)}"
             )
         train_loss = step_fn(step, scale)
         with torch.no_grad():
@@ -1681,7 +1699,7 @@ def train_and_eval(h, device):
     def _activate_eval_features(m):
         if h.num_loops > 0:
             m.looping_active = True
-        if m.repeated_pass_mlp_loras:
+        if m.recurrent_mlp_loras:
             m.mlp_lora_active = True
 
     eval_model = deserialize(h, device)
