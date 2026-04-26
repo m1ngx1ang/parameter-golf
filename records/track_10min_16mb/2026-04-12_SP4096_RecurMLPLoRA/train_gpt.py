@@ -63,7 +63,6 @@ class Hyperparameters:
     vocab_size = int(os.environ.get("VOCAB_SIZE", 4096))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
-    embedding_dim = int(os.environ.get("EMBEDDING_DIM", 512))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 4.0))
@@ -547,13 +546,7 @@ class GPT(nn.Module):
         self.tie_embeddings = h.tie_embeddings
         self.tied_embed_init_std = h.tied_embed_init_std
         self.logit_softcap = h.logit_softcap
-        self.tok_emb = nn.Embedding(h.vocab_size, h.embedding_dim)
-        if h.embedding_dim != h.model_dim:
-            self.embed_proj = CastedLinear(h.embedding_dim, h.model_dim, bias=False)
-            self.head_proj = CastedLinear(h.model_dim, h.embedding_dim, bias=False)
-        else:
-            self.embed_proj = None
-            self.head_proj = None
+        self.tok_emb = nn.Embedding(h.vocab_size, h.model_dim)
         self.num_encoder_layers = h.num_layers // 2
         self.num_decoder_layers = h.num_layers - self.num_encoder_layers
         self.blocks = nn.ModuleList(
@@ -588,7 +581,7 @@ class GPT(nn.Module):
         self.lm_head = (
             None
             if h.tie_embeddings
-            else CastedLinear(h.embedding_dim, h.vocab_size, bias=False)
+            else CastedLinear(h.model_dim, h.vocab_size, bias=False)
         )
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -703,8 +696,6 @@ class GPT(nn.Module):
     def forward_logits(self, input_ids):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
-        if self.embed_proj is not None:
-            x = self.embed_proj(x)
         x0 = x
         skips = []
         enc_plan = (
@@ -736,8 +727,6 @@ class GPT(nn.Module):
                 dummy = dummy + adapter.zero_proxy().to(dtype=x.dtype, device=x.device)
             x = x + dummy
         x = self.final_norm(x)
-        if self.head_proj is not None:
-            x = self.head_proj(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
@@ -995,11 +984,8 @@ def collect_hessians(model, train_loader, h, device, n_calibration_batches=64):
             if classify_param(name + ".weight") in ("mlp", "attn"):
                 hooks.append(module.register_forward_hook(make_hook(name + ".weight")))
     if model.tie_embeddings:
-        hook_module = (
-            model.head_proj if model.head_proj is not None else model.final_norm
-        )
         hooks.append(
-            hook_module.register_forward_hook(
+            model.final_norm.register_forward_hook(
                 lambda module, inp, out: _accumulate("tok_emb.weight", out)
             )
         )
@@ -1729,6 +1715,13 @@ def main():
     h = Hyperparameters()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
+    if (
+        "EMBEDDING_DIM" in os.environ
+        and int(os.environ["EMBEDDING_DIM"]) != h.model_dim
+    ):
+        raise ValueError(
+            "EMBEDDING_DIM is no longer a separate model width; set MODEL_DIM instead"
+        )
     if h.world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {h.world_size}")
     if 8 % h.world_size != 0:
