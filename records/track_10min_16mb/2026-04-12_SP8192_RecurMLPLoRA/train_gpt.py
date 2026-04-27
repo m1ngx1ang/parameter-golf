@@ -90,7 +90,7 @@ class Hyperparameters:
     mlp_lora_eps = float(os.environ.get("MLP_LORA_EPS", 1e-08))
     mlp_lora_warmup_steps = int(os.environ.get("MLP_LORA_WARMUP_STEPS", 100))
     mlp_lora_layers = os.environ.get("MLP_LORA_LAYERS", "").strip()
-    enable_mlp_lora_at = float(os.environ.get("ENABLE_MLP_LORA_AT", os.environ.get("ENABLE_LOOPING_AT", 0.35)))
+    loop_settle_frac = float(os.environ.get("LOOP_SETTLE_FRAC", 0.10))
     parallel_residual_start = int(os.environ.get("PARALLEL_RESIDUAL_START", 7))
     min_lr = float(os.environ.get("MIN_LR", 0.0))
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -111,12 +111,11 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-08))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
-    muon_beta2 = float(os.environ.get("MUON_BETA2", 0.95))
     adam_wd = float(os.environ.get("ADAM_WD", 0.02))
     muon_wd = float(os.environ.get("MUON_WD", 0.095))
     embed_wd = float(os.environ.get("EMBED_WD", 0.085))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.9965))
-    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.005))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
@@ -454,11 +453,16 @@ class MLP(nn.Module):
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
-    def forward(self, x, lora=None, lora_enabled=False):
+    def forward(self, x, lora=None, lora_enabled=False, lora_gain=1.0):
         hidden = F.leaky_relu(self.fc(x), negative_slope=0.5).square()
         out = self.proj(hidden)
         if lora is not None:
-            out = out + lora(hidden, enabled=lora_enabled)
+            delta = lora(hidden, enabled=lora_enabled)
+            if isinstance(lora_gain, Tensor):
+                delta = delta * lora_gain.to(dtype=delta.dtype)
+            else:
+                delta = delta * float(lora_gain)
+            out = out + delta
         return out
 
 
@@ -523,7 +527,7 @@ class Block(nn.Module):
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
         self.parallel = False
 
-    def forward(self, x, x0, mlp_lora=None, mlp_lora_enabled=False):
+    def forward(self, x, x0, mlp_lora=None, mlp_lora_enabled=False, mlp_lora_gain=1.0):
         if self.stable_resid_mix:
             carry = torch.exp(-torch.exp(self.resid_carry_log.clamp(-20, 20))).to(dtype=x.dtype)
             input_scale = self.resid_input_scale.to(dtype=x.dtype)
@@ -534,7 +538,9 @@ class Block(nn.Module):
         attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor)
         attn_s = self.attn_scale.to(dtype=x_in.dtype)[None, None, :]
         mlp_s = self.mlp_scale.to(dtype=x_in.dtype)[None, None, :]
-        mlp_kw = dict(lora=mlp_lora, lora_enabled=mlp_lora_enabled)
+        mlp_kw = dict(
+            lora=mlp_lora, lora_enabled=mlp_lora_enabled, lora_gain=mlp_lora_gain
+        )
         if self.parallel:
             mlp_in = self.mlp_norm(x_in) * self.ln_scale_factor
             return x_in + attn_s * attn_out + mlp_s * self.mlp(mlp_in, **mlp_kw)
@@ -669,6 +675,9 @@ class GPT(nn.Module):
             else:
                 self.virtual_mlp_lora_indices.append(-1)
         self.mlp_lora_active = False
+        self.register_buffer(
+            "mlp_lora_gain", torch.tensor(1.0, dtype=torch.float32), persistent=False
+        )
         self._init_weights()
 
     def _init_weights(self):
@@ -696,6 +705,7 @@ class GPT(nn.Module):
             x0,
             mlp_lora=self.recurrent_mlp_loras[lora_idx],
             mlp_lora_enabled=self.mlp_lora_active,
+            mlp_lora_gain=self.mlp_lora_gain,
         )
 
     def forward_logits(self, input_ids):
@@ -722,7 +732,7 @@ class GPT(nn.Module):
                     g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[
                         None, None, :
                     ]
-                    x = torch.lerp(scaled_skip, x, g) * 2.0
+                    x = torch.lerp(scaled_skip, x, g)
                 else:
                     x = x + scaled_skip
             x = self._run_block(i, x, x0, virtual_idx)
@@ -1283,7 +1293,7 @@ def eval_val(h, device, val_data, model):
     seq_end = total_seqs * (h.rank + 1) // h.world_size
     val_loss_sum, val_token_count, val_byte_count = _zero_accumulators(device)
     model.eval()
-    with torch.inference_mode():
+    with torch.no_grad():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
             raw_start = batch_seq_start * seq_len
@@ -1494,12 +1504,16 @@ def train_model(h, device, val_data):
         model = DDP(compiled_model, device_ids=[h.local_rank], broadcast_buffers=False)
     else:
         model = compiled_model
+    lora_enable_at = h.enable_looping_at + h.loop_settle_frac
     log(f"model_params:{sum(p.numel() for p in base_model.parameters())}")
     log(
         f"stable_resid_mix:{int(h.stable_resid_mix)} carry_init:{h.stable_resid_carry_init:.4f}"
     )
     log(
-        f"repeated_pass_mlp_lora: rank={base_model.mlp_lora_rank} requested_rank={h.mlp_lora_rank} alpha={h.mlp_lora_alpha} layers={base_model.mlp_lora_layers} adapters={len(base_model.recurrent_mlp_loras)} enable_at={h.enable_mlp_lora_at:.2f}"
+        f"repeated_pass_mlp_lora: rank={base_model.mlp_lora_rank} requested_rank={h.mlp_lora_rank} alpha={h.mlp_lora_alpha} layers={base_model.mlp_lora_layers} adapters={len(base_model.recurrent_mlp_loras)} enable_at={lora_enable_at:.3f}"
+    )
+    log(
+        f"mlp_lora_schedule: loop_enable_at={h.enable_looping_at:.3f} loop_settle_frac={h.loop_settle_frac:.3f} enable_at={lora_enable_at:.3f}"
     )
     optimizers = Optimizers(h, base_model)
     train_loader = ShuffledSequenceLoader(h, device)
@@ -1639,16 +1653,20 @@ def train_model(h, device, val_data):
         if (
             base_model.recurrent_mlp_loras
             and not base_model.mlp_lora_active
-            and frac >= h.enable_mlp_lora_at
+            and frac >= lora_enable_at
         ):
             base_model.mlp_lora_active = True
             lora_start_step = step
             log(
-                f"mlp_lora:enabled step:{step} frac:{frac:.3f} adapters:{len(base_model.recurrent_mlp_loras)}"
+                f"mlp_lora:enabled step:{step} frac:{frac:.3f} adapters:{len(base_model.recurrent_mlp_loras)} enable_at:{lora_enable_at:.3f}"
             )
         lora_warmup_mul = 1.0
         if lora_start_step is not None and h.mlp_lora_warmup_steps > 0:
             lora_warmup_mul = min(1.0, (step - lora_start_step) / h.mlp_lora_warmup_steps)
+        if base_model.recurrent_mlp_loras:
+            base_model.mlp_lora_gain.fill_(
+                lora_warmup_mul if base_model.mlp_lora_active else 0.0
+            )
         train_loss = step_fn(step, scale, lora_lr_scale=lora_warmup_mul)
         with torch.no_grad():
             current_fp32 = [t.detach().float() for t in ema_source_tensors]
@@ -1709,6 +1727,7 @@ def train_and_eval(h, device):
             m.looping_active = True
         if m.recurrent_mlp_loras:
             m.mlp_lora_active = True
+            m.mlp_lora_gain.fill_(1.0)
 
     eval_model = deserialize(h, device)
     _activate_eval_features(eval_model)
@@ -1737,6 +1756,15 @@ def main():
     h = Hyperparameters()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
+    if "ENABLE_MLP_LORA_AT" in os.environ:
+        raise ValueError(
+            "ENABLE_MLP_LORA_AT has been removed; use LOOP_SETTLE_FRAC "
+            "to schedule LoRA relative to ENABLE_LOOPING_AT."
+        )
+    if h.loop_settle_frac < 0.0:
+        raise ValueError(
+            f"LOOP_SETTLE_FRAC must be non-negative, got {h.loop_settle_frac}"
+        )
     if (
         "EMBEDDING_DIM" in os.environ
         and int(os.environ["EMBEDDING_DIM"]) != h.model_dim
