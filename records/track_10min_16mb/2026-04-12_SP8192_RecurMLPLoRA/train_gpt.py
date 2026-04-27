@@ -83,8 +83,12 @@ class Hyperparameters:
     enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", 0.35))
     mlp_lora_rank = int(os.environ.get("MLP_LORA_RANK", 4))
     mlp_lora_alpha = float(os.environ.get("MLP_LORA_ALPHA", 4.0))
-    mlp_lora_lr = float(os.environ.get("MLP_LORA_LR", 0.04))
-    mlp_lora_wd = float(os.environ.get("MLP_LORA_WD", 0.0))
+    mlp_lora_lr = float(os.environ.get("MLP_LORA_LR", 0.015))
+    mlp_lora_wd = float(os.environ.get("MLP_LORA_WD", 0.02))
+    mlp_lora_beta1 = float(os.environ.get("MLP_LORA_BETA1", 0.9))
+    mlp_lora_beta2 = float(os.environ.get("MLP_LORA_BETA2", 0.99))
+    mlp_lora_eps = float(os.environ.get("MLP_LORA_EPS", 1e-08))
+    mlp_lora_warmup_steps = int(os.environ.get("MLP_LORA_WARMUP_STEPS", 100))
     mlp_lora_layers = os.environ.get("MLP_LORA_LAYERS", "").strip()
     enable_mlp_lora_at = float(os.environ.get("ENABLE_MLP_LORA_AT", os.environ.get("ENABLE_LOOPING_AT", 0.35)))
     parallel_residual_start = int(os.environ.get("PARALLEL_RESIDUAL_START", 7))
@@ -913,7 +917,9 @@ class Optimizers:
                     }
                 ],
                 weight_decay=h.mlp_lora_wd,
-                **adam_kw,
+                betas=(h.mlp_lora_beta1, h.mlp_lora_beta2),
+                eps=h.mlp_lora_eps,
+                fused=True,
             )
             self.optimizers.insert(2, self.optimizer_lora)
         else:
@@ -1518,7 +1524,7 @@ def train_model(h, device, val_data):
             return max((1.0 - frac) / h.warmdown_frac, h.min_lr)
         return 1.0
 
-    def step_fn(step, lr_scale):
+    def step_fn(step, lr_scale, lora_lr_scale=1.0):
         optimizers.zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(h.grad_accum_steps):
@@ -1543,6 +1549,9 @@ def train_model(h, device, val_data):
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * lr_scale
+        if optimizers.optimizer_lora is not None and lora_lr_scale < 1.0:
+            for group in optimizers.optimizer_lora.param_groups:
+                group["lr"] *= lora_lr_scale
         if h.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), h.grad_clip_norm)
         optimizers.step()
@@ -1587,6 +1596,7 @@ def train_model(h, device, val_data):
     ema_decay = h.ema_decay
     training_time_ms = 0.0
     stop_after_step = None
+    lora_start_step = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     step = 0
@@ -1632,10 +1642,14 @@ def train_model(h, device, val_data):
             and frac >= h.enable_mlp_lora_at
         ):
             base_model.mlp_lora_active = True
+            lora_start_step = step
             log(
                 f"mlp_lora:enabled step:{step} frac:{frac:.3f} adapters:{len(base_model.recurrent_mlp_loras)}"
             )
-        train_loss = step_fn(step, scale)
+        lora_warmup_mul = 1.0
+        if lora_start_step is not None and h.mlp_lora_warmup_steps > 0:
+            lora_warmup_mul = min(1.0, (step - lora_start_step) / h.mlp_lora_warmup_steps)
+        train_loss = step_fn(step, scale, lora_lr_scale=lora_warmup_mul)
         with torch.no_grad():
             current_fp32 = [t.detach().float() for t in ema_source_tensors]
             torch._foreach_mul_(ema_tensors, ema_decay)
