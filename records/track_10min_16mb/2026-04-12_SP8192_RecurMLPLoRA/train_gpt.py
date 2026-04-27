@@ -453,11 +453,11 @@ class MLP(nn.Module):
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
-    def forward(self, x, lora=None, lora_enabled=False, lora_gain=1.0):
+    def forward(self, x, lora=None, lora_gain=1.0):
         hidden = F.leaky_relu(self.fc(x), negative_slope=0.5).square()
         out = self.proj(hidden)
         if lora is not None:
-            delta = lora(hidden, enabled=lora_enabled)
+            delta = lora(hidden)
             if isinstance(lora_gain, Tensor):
                 delta = delta * lora_gain.to(dtype=delta.dtype)
             else:
@@ -475,10 +475,7 @@ class LoRAAdapter(nn.Module):
         self.up = nn.Parameter(torch.zeros(model_dim, rank))
         nn.init.kaiming_uniform_(self.down, a=math.sqrt(5))
 
-    def forward(self, hidden, enabled=True):
-        if not enabled:
-            # Keep parameters in the gradient graph for DDP without computing the full delta.
-            return (self.down.sum() + self.up.sum()).to(hidden.dtype) * 0.0
+    def forward(self, hidden):
         delta = F.linear(
             F.linear(hidden, self.down.to(hidden.dtype)), self.up.to(hidden.dtype)
         )
@@ -527,7 +524,7 @@ class Block(nn.Module):
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
         self.parallel = False
 
-    def forward(self, x, x0, mlp_lora=None, mlp_lora_enabled=False, mlp_lora_gain=1.0):
+    def forward(self, x, x0, mlp_lora=None, mlp_lora_gain=1.0):
         if self.stable_resid_mix:
             carry = torch.exp(-torch.exp(self.resid_carry_log.clamp(-20, 20))).to(dtype=x.dtype)
             input_scale = self.resid_input_scale.to(dtype=x.dtype)
@@ -538,9 +535,7 @@ class Block(nn.Module):
         attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor)
         attn_s = self.attn_scale.to(dtype=x_in.dtype)[None, None, :]
         mlp_s = self.mlp_scale.to(dtype=x_in.dtype)[None, None, :]
-        mlp_kw = dict(
-            lora=mlp_lora, lora_enabled=mlp_lora_enabled, lora_gain=mlp_lora_gain
-        )
+        mlp_kw = dict(lora=mlp_lora, lora_gain=mlp_lora_gain)
         if self.parallel:
             mlp_in = self.mlp_norm(x_in) * self.ln_scale_factor
             return x_in + attn_s * attn_out + mlp_s * self.mlp(mlp_in, **mlp_kw)
@@ -674,9 +669,8 @@ class GPT(nn.Module):
                 )
             else:
                 self.virtual_mlp_lora_indices.append(-1)
-        self.mlp_lora_active = False
         self.register_buffer(
-            "mlp_lora_gain", torch.tensor(1.0, dtype=torch.float32), persistent=False
+            "mlp_lora_gain", torch.tensor(0.0, dtype=torch.float32), persistent=False
         )
         self._init_weights()
 
@@ -704,7 +698,6 @@ class GPT(nn.Module):
             x,
             x0,
             mlp_lora=self.recurrent_mlp_loras[lora_idx],
-            mlp_lora_enabled=self.mlp_lora_active,
             mlp_lora_gain=self.mlp_lora_gain,
         )
 
@@ -1589,11 +1582,15 @@ def train_model(h, device, val_data):
         _run_warmup("warmup_step")
         if h.num_loops > 0:
             base_model.looping_active = True
+            if base_model.recurrent_mlp_loras:
+                base_model.mlp_lora_gain.fill_(1.0)
             log(
                 f"loop_warmup:enabled encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}"
             )
             _run_warmup("loop_warmup_step")
             base_model.looping_active = False
+            if base_model.recurrent_mlp_loras:
+                base_model.mlp_lora_gain.fill_(0.0)
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -1652,10 +1649,9 @@ def train_model(h, device, val_data):
             )
         if (
             base_model.recurrent_mlp_loras
-            and not base_model.mlp_lora_active
+            and lora_start_step is None
             and frac >= lora_enable_at
         ):
-            base_model.mlp_lora_active = True
             lora_start_step = step
             log(
                 f"mlp_lora:enabled step:{step} frac:{frac:.3f} adapters:{len(base_model.recurrent_mlp_loras)} enable_at:{lora_enable_at:.3f}"
@@ -1665,7 +1661,7 @@ def train_model(h, device, val_data):
             lora_warmup_mul = min(1.0, (step - lora_start_step) / h.mlp_lora_warmup_steps)
         if base_model.recurrent_mlp_loras:
             base_model.mlp_lora_gain.fill_(
-                lora_warmup_mul if base_model.mlp_lora_active else 0.0
+                lora_warmup_mul if lora_start_step is not None else 0.0
             )
         train_loss = step_fn(step, scale, lora_lr_scale=lora_warmup_mul)
         with torch.no_grad():
@@ -1726,7 +1722,6 @@ def train_and_eval(h, device):
         if h.num_loops > 0:
             m.looping_active = True
         if m.recurrent_mlp_loras:
-            m.mlp_lora_active = True
             m.mlp_lora_gain.fill_(1.0)
 
     eval_model = deserialize(h, device)
