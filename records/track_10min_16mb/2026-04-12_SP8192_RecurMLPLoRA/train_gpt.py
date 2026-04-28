@@ -454,35 +454,36 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x, lora=None, lora_gain=1.0):
-        hidden = F.leaky_relu(self.fc(x), negative_slope=0.5).square()
-        out = self.proj(hidden)
         if lora is not None:
-            delta = lora(hidden)
+            delta = lora(x)
             if isinstance(lora_gain, Tensor):
                 delta = delta * lora_gain.to(dtype=delta.dtype)
             else:
                 delta = delta * float(lora_gain)
-            out = out + delta
+            fc_out = self.fc(x) + delta
+        else:
+            fc_out = self.fc(x)
+        hidden = F.leaky_relu(fc_out, negative_slope=0.5).square()
+        out = self.proj(hidden)
         return out
 
 
 class LoRAAdapter(nn.Module):
-    def __init__(self, hidden_dim, model_dim, rank, alpha=1.0):
+    def __init__(self, in_dim, out_dim, rank, alpha=1.0):
         super().__init__()
         self.rank = rank
         self.scaling = alpha / max(rank, 1)
-        self.down = nn.Parameter(torch.empty(rank, hidden_dim))
-        self.up = nn.Parameter(torch.zeros(model_dim, rank))
-        nn.init.kaiming_uniform_(self.down, a=math.sqrt(5))
+        self.down = CastedLinear(in_dim, rank, bias=False)
+        self.up = CastedLinear(rank, out_dim, bias=False)
+        nn.init.kaiming_uniform_(self.down.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.up.weight)
 
-    def forward(self, hidden):
-        delta = F.linear(
-            F.linear(hidden, self.down.to(hidden.dtype)), self.up.to(hidden.dtype)
-        )
+    def forward(self, x):
+        delta = self.up(self.down(x))
         return delta * self.scaling
 
     def zero_proxy(self):
-        return (self.down.sum() + self.up.sum()) * 0.0
+        return (self.down.weight.sum() + self.up.weight.sum()) * 0.0
 
 
 class Block(nn.Module):
@@ -664,7 +665,7 @@ class GPT(nn.Module):
                 self.virtual_mlp_lora_indices.append(len(self.recurrent_mlp_loras))
                 self.recurrent_mlp_loras.append(
                     LoRAAdapter(
-                        hidden_dim, h.model_dim, self.mlp_lora_rank, h.mlp_lora_alpha
+                        h.model_dim, hidden_dim, self.mlp_lora_rank, h.mlp_lora_alpha
                     )
                 )
             else:
