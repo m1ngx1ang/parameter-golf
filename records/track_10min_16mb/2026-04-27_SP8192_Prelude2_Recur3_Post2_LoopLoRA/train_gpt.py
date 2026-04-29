@@ -18,7 +18,7 @@ import sentencepiece as spm
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch import Tensor, nn
+from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 FLASH_ATTN_BACKEND = "flash_attn_3"
@@ -69,7 +69,7 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     prelude_mlp_mult = float(os.environ.get("PRELUDE_MLP_MULT", 4.0))
-    recurrent_mlp_mult = float(os.environ.get("RECURRENT_MLP_MULT", 6.0))
+    recurrent_mlp_mult = float(os.environ.get("RECURRENT_MLP_MULT", 4.0))
     postlude_mlp_mult = float(os.environ.get("POSTLUDE_MLP_MULT", 4.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 3e1))
@@ -77,19 +77,15 @@ class Hyperparameters:
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.25))
-    num_recur_loops = int(os.environ.get("NUM_RECUR_LOOPS", 2))
-    enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", 0.35))
+    recur_depths = tuple(
+        int(d) for d in os.environ.get("RECUR_DEPTHS", "2,3,4").split(",") if d.strip()
+    )
+    recur_depth_eval = int(os.environ.get("RECUR_DEPTH_EVAL", 3))
     recur_carry_init = float(os.environ.get("RECUR_CARRY_INIT", 0.99))
-    recur_input_scale_init = float(os.environ.get("RECUR_INPUT_SCALE_INIT", 0.0))
-    mlp_lora_rank = int(os.environ.get("MLP_LORA_RANK", 8))
-    mlp_lora_alpha = float(os.environ.get("MLP_LORA_ALPHA", 8.0))
-    mlp_lora_lr = float(os.environ.get("MLP_LORA_LR", 0.015))
-    mlp_lora_wd = float(os.environ.get("MLP_LORA_WD", 0.02))
-    mlp_lora_beta1 = float(os.environ.get("MLP_LORA_BETA1", 0.9))
-    mlp_lora_beta2 = float(os.environ.get("MLP_LORA_BETA2", 0.99))
-    mlp_lora_eps = float(os.environ.get("MLP_LORA_EPS", 1e-08))
-    mlp_lora_warmup_steps = int(os.environ.get("MLP_LORA_WARMUP_STEPS", 100))
-    loop_settle_frac = float(os.environ.get("LOOP_SETTLE_FRAC", 0.10))
+    recur_input_scale_init = float(os.environ.get("RECUR_INPUT_SCALE_INIT", 0.01))
+    recur_h0_from_encoded = bool(int(os.environ.get("RECUR_H0_FROM_ENCODED", "1")))
+    recur_bptt_tail = int(os.environ.get("RECUR_BPTT_TAIL", 0))
+    encoded_ln_enabled = bool(int(os.environ.get("ENCODED_LN_ENABLED", "1")))
     parallel_residual_start = int(os.environ.get("PARALLEL_RESIDUAL_START", 5))
     min_lr = float(os.environ.get("MIN_LR", 0.0))
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -371,18 +367,17 @@ class Rotary(nn.Module):
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
 
-def _rotate(x, cos, sin):
-    half = x.size(-1) // 2
-    x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat((x1 * cos + x2 * sin, x1 * -sin + x2 * cos), dim=-1)
-
-
 def apply_rotary_emb(x, cos, sin, rope_dims=0):
     if rope_dims > 0 and rope_dims < x.size(-1):
+        x_rot, x_pass = x[..., :rope_dims], x[..., rope_dims:]
+        half = rope_dims // 2
+        x1, x2 = x_rot[..., :half], x_rot[..., half:]
         return torch.cat(
-            (_rotate(x[..., :rope_dims], cos, sin), x[..., rope_dims:]), dim=-1
+            (x1 * cos + x2 * sin, -x1 * sin + x2 * cos, x_pass), dim=-1
         )
-    return _rotate(x, cos, sin)
+    half = x.size(-1) // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat((x1 * cos + x2 * sin, -x1 * sin + x2 * cos), dim=-1)
 
 
 class CausalSelfAttention(nn.Module):
@@ -448,37 +443,9 @@ class MLP(nn.Module):
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
-    def forward(self, x, lora=None, lora_gain=1.0):
-        if lora is not None:
-            delta = lora(x)
-            if isinstance(lora_gain, Tensor):
-                delta = delta * lora_gain.to(dtype=delta.dtype)
-            else:
-                delta = delta * float(lora_gain)
-            fc_out = self.fc(x) + delta
-        else:
-            fc_out = self.fc(x)
-        hidden = F.leaky_relu(fc_out, negative_slope=0.5).square()
-        out = self.proj(hidden)
-        return out
-
-
-class LoRAAdapter(nn.Module):
-    def __init__(self, in_dim, out_dim, rank, alpha=1.0):
-        super().__init__()
-        self.rank = rank
-        self.scaling = alpha / max(rank, 1)
-        self.down = CastedLinear(in_dim, rank, bias=False)
-        self.up = CastedLinear(rank, out_dim, bias=False)
-        nn.init.kaiming_uniform_(self.down.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.up.weight)
-
     def forward(self, x):
-        delta = self.up(self.down(x))
-        return delta * self.scaling
-
-    def zero_proxy(self):
-        return (self.down.weight.sum() + self.up.weight.sum()) * 0.0
+        hidden = F.leaky_relu(self.fc(x), negative_slope=0.5).square()
+        return self.proj(hidden)
 
 
 class Block(nn.Module):
@@ -509,19 +476,18 @@ class Block(nn.Module):
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
         self.parallel = False
 
-    def forward(self, x, x0, mlp_lora=None, mlp_lora_gain=1.0):
+    def forward(self, x, x0):
         mix = self.resid_mix.to(dtype=x.dtype)
-        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        x_in = mix[0] * x + mix[1] * x0
+        attn_s = self.attn_scale.to(x.dtype)
+        mlp_s = self.mlp_scale.to(x.dtype)
         attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor)
-        attn_s = self.attn_scale.to(dtype=x_in.dtype)[None, None, :]
-        mlp_s = self.mlp_scale.to(dtype=x_in.dtype)[None, None, :]
-        mlp_kw = dict(lora=mlp_lora, lora_gain=mlp_lora_gain)
         if self.parallel:
             mlp_in = self.mlp_norm(x_in) * self.ln_scale_factor
-            return x_in + attn_s * attn_out + mlp_s * self.mlp(mlp_in, **mlp_kw)
+            return x_in + attn_s * attn_out + mlp_s * self.mlp(mlp_in)
         x_out = x_in + attn_s * attn_out
         mlp_in = self.mlp_norm(x_out) * self.ln_scale_factor
-        return x_out + mlp_s * self.mlp(mlp_in, **mlp_kw)
+        return x_out + mlp_s * self.mlp(mlp_in)
 
 
 class GPT(nn.Module):
@@ -588,7 +554,6 @@ class GPT(nn.Module):
         self.skip_gates = nn.Parameter(
             torch.zeros(self.num_skip_weights, h.model_dim, dtype=torch.float32)
         )
-        self.num_recur_passes = h.num_recur_loops + 1
         carry_init = min(max(h.recur_carry_init, 1e-4), 1.0 - 1e-4)
         raw_carry_init = math.log(-math.log(carry_init))
         self.recur_carry_log = nn.Parameter(
@@ -597,40 +562,15 @@ class GPT(nn.Module):
         self.recur_input_scale = nn.Parameter(
             torch.full((h.model_dim,), h.recur_input_scale_init, dtype=torch.float32)
         )
-        self.looping_active = False
-        recurrent_hidden_dim = int(h.recurrent_mlp_mult * h.model_dim)
-        max_sparse_lora_rank = min(
-            PASSTHROUGH_TENSOR_MAX_NUMEL // recurrent_hidden_dim,
-            PASSTHROUGH_TENSOR_MAX_NUMEL // h.model_dim,
-        )
-        self.mlp_lora_rank = min(h.mlp_lora_rank, max_sparse_lora_rank)
-        if h.mlp_lora_rank > self.mlp_lora_rank:
-            log(
-                f"mlp_lora:rank clipped from {h.mlp_lora_rank} to {self.mlp_lora_rank} "
-                f"to keep adapter tensors <= {PASSTHROUGH_TENSOR_MAX_NUMEL} params"
-            )
-        self.recurrent_mlp_loras = nn.ModuleList()
-        self.virtual_mlp_lora_indices = []
-        for _ in range(self.num_recur_passes):
-            for _ in self.recurrent_indices:
-                if (
-                    h.num_recur_loops > 0
-                    and self.mlp_lora_rank > 0
-                ):
-                    self.virtual_mlp_lora_indices.append(len(self.recurrent_mlp_loras))
-                    self.recurrent_mlp_loras.append(
-                        LoRAAdapter(
-                            h.model_dim,
-                            recurrent_hidden_dim,
-                            self.mlp_lora_rank,
-                            h.mlp_lora_alpha,
-                        )
-                    )
-                else:
-                    self.virtual_mlp_lora_indices.append(-1)
-        self.register_buffer(
-            "mlp_lora_gain", torch.tensor(0.0, dtype=torch.float32), persistent=False
-        )
+        self.encoded_ln_enabled = h.encoded_ln_enabled
+        self.encoded_ln = RMSNorm() if h.encoded_ln_enabled else None
+        valid_depths = tuple(d for d in h.recur_depths if d > 0)
+        if not valid_depths:
+            raise ValueError("RECUR_DEPTHS must contain at least one positive value")
+        self.recur_depths = valid_depths
+        self.recur_depth = h.recur_depth_eval if h.recur_depth_eval > 0 else valid_depths[0]
+        self.recur_h0_from_encoded = h.recur_h0_from_encoded
+        self.recur_bptt_tail = max(0, int(h.recur_bptt_tail))
         self._init_weights()
 
     def _init_weights(self):
@@ -647,66 +587,34 @@ class GPT(nn.Module):
                 ):
                     nn.init.orthogonal_(module.weight, gain=1.0)
 
-    def _run_block(self, i, x, x0, lora_idx=-1):
-        if lora_idx < 0:
-            return self.blocks[i](x, x0)
-        return self.blocks[i](
-            x,
-            x0,
-            mlp_lora=self.recurrent_mlp_loras[lora_idx],
-            mlp_lora_gain=self.mlp_lora_gain,
-        )
-
-    def _apply_recurrent_injection(self, h_prev, encoded_input, core_out):
-        carry = torch.exp(-torch.exp(self.recur_carry_log.clamp(-20, 20))).to(
-            dtype=core_out.dtype
-        )
-        inject = self.recur_input_scale.to(dtype=core_out.dtype)
-        return (
-            carry[None, None, :] * h_prev
-            + inject[None, None, :] * encoded_input
-            + core_out
-        )
-
     def forward_logits(self, input_ids):
-        x = self.tok_emb(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
+        x = F.rms_norm(self.tok_emb(input_ids), (self.tok_emb.weight.size(1),))
         input_anchor = x
-        if self.looping_active:
-            skips = []
-            for i in self.prelude_indices:
-                x = self._run_block(i, x, input_anchor)
-                skips.append(x)
-            encoded_input = x
-            h_state = encoded_input
-            plan_idx = 0
-            for _ in range(self.num_recur_passes):
-                core = h_state
-                for i in self.recurrent_indices:
-                    lora_idx = self.virtual_mlp_lora_indices[plan_idx]
-                    core = self._run_block(i, core, encoded_input, lora_idx=lora_idx)
-                    plan_idx += 1
-                h_state = self._apply_recurrent_injection(h_state, encoded_input, core)
-            x = h_state
-            for skip_idx, i in enumerate(self.postlude_indices):
-                if skip_idx < self.num_skip_weights and skips:
-                    scaled_skip = (
-                        self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :]
-                        * skips.pop()
-                    )
-                    g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[
-                        None, None, :
-                    ]
-                    x = torch.lerp(scaled_skip, x, g)
-                x = self._run_block(i, x, encoded_input)
-        else:
-            for i in range(len(self.blocks)):
-                x = self._run_block(i, x, input_anchor)
-        if not self.looping_active and self.recurrent_mlp_loras:
-            dummy = torch.zeros((), device=x.device, dtype=x.dtype)
-            for adapter in self.recurrent_mlp_loras:
-                dummy = dummy + adapter.zero_proxy().to(dtype=x.dtype, device=x.device)
-            x = x + dummy
+        skips = []
+        for i in self.prelude_indices:
+            x = self.blocks[i](x, input_anchor)
+            skips.append(x)
+        encoded = self.encoded_ln(x) if self.encoded_ln is not None else x
+        carry = torch.exp(-torch.exp(self.recur_carry_log.clamp(-20, 20))).to(x.dtype)
+        inject = self.recur_input_scale.to(x.dtype)
+        h_state = encoded if self.recur_h0_from_encoded else torch.zeros_like(encoded)
+        depth = self.recur_depth
+        bptt_tail = self.recur_bptt_tail if self.recur_bptt_tail > 0 else depth
+        detach_until = max(0, depth - bptt_tail)
+        for t in range(depth):
+            if t == detach_until and detach_until > 0:
+                h_state = h_state.detach()
+            core = h_state
+            for i in self.recurrent_indices:
+                core = self.blocks[i](core, encoded)
+            h_state = carry * h_state + inject * encoded + core
+        x = h_state
+        for skip_idx, i in enumerate(self.postlude_indices):
+            if skip_idx < self.num_skip_weights and skips:
+                scaled_skip = self.skip_weights[skip_idx].to(x.dtype) * skips.pop()
+                g = torch.sigmoid(self.skip_gates[skip_idx].to(x.dtype))
+                x = torch.lerp(scaled_skip, x, g)
+            x = self.blocks[i](x, encoded)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -726,7 +634,7 @@ class GPT(nn.Module):
 def classify_param(name):
     if "tok_emb" in name or "lm_head" in name:
         return "embed"
-    if name.startswith("recurrent_mlp_loras") or ".mlp." in name:
+    if ".mlp." in name:
         return "mlp"
     if ".attn." in name or ".proj." in name:
         return "attn"
@@ -883,24 +791,6 @@ class Optimizers:
             self.optimizer_muon,
             self.optimizer_scalar,
         ]
-        lora_params = list(base_model.recurrent_mlp_loras.parameters())
-        if lora_params:
-            self.optimizer_lora = torch.optim.AdamW(
-                [
-                    {
-                        "params": lora_params,
-                        "lr": h.mlp_lora_lr,
-                        "base_lr": h.mlp_lora_lr,
-                    }
-                ],
-                weight_decay=h.mlp_lora_wd,
-                betas=(h.mlp_lora_beta1, h.mlp_lora_beta2),
-                eps=h.mlp_lora_eps,
-                fused=True,
-            )
-            self.optimizers.insert(2, self.optimizer_lora)
-        else:
-            self.optimizer_lora = None
         if base_model.lm_head is not None:
             self.optimizer_head = torch.optim.Adam(
                 [
@@ -937,9 +827,7 @@ def restore_fp32_params(model):
         is_control = param.ndim < 2 or any(
             p in name for p in CONTROL_TENSOR_NAME_PATTERNS
         )
-        if (
-            is_control or name.startswith("recurrent_mlp_loras")
-        ) and param.dtype != torch.float32:
+        if is_control and param.dtype != torch.float32:
             param.data = param.data.float()
 
 
@@ -974,10 +862,15 @@ def collect_hessians(model, train_loader, h, device, n_calibration_batches=64):
             )
         )
     model.eval()
+    saved_depth = model.recur_depth
+    depths = list(model.recur_depths) or [saved_depth]
+    log(f"GPTQ:calibrating over recur_depths={depths} batches={n_calibration_batches}")
     with torch.no_grad():
-        for _ in range(n_calibration_batches):
+        for i in range(n_calibration_batches):
+            model.recur_depth = depths[i % len(depths)]
             x, _ = train_loader.next_batch(h.train_batch_tokens, h.grad_accum_steps)
             model.forward_logits(x)
+    model.recur_depth = saved_depth
     for hook in hooks:
         hook.remove()
     for name in hessians:
@@ -1471,20 +1364,19 @@ def train_model(h, device, val_data):
         model = DDP(compiled_model, device_ids=[h.local_rank], broadcast_buffers=False)
     else:
         model = compiled_model
-    lora_enable_at = h.enable_looping_at + h.loop_settle_frac
     log(f"model_params:{sum(p.numel() for p in base_model.parameters())}")
     log("block_residual_mode: resid_mix")
     log(
-        f"depth_recur_layout: prelude={base_model.prelude_indices} recurrent={base_model.recurrent_indices} postlude={base_model.postlude_indices} skip_bridges={base_model.num_skip_weights} extra_loops={h.num_recur_loops} passes={base_model.num_recur_passes}"
+        f"depth_recur_layout: prelude={base_model.prelude_indices} recurrent={base_model.recurrent_indices} postlude={base_model.postlude_indices} skip_bridges={base_model.num_skip_weights}"
     )
     log(
         f"depth_recur_mlp_mults: prelude={h.prelude_mlp_mult} recurrent={h.recurrent_mlp_mult} postlude={h.postlude_mlp_mult}"
     )
     log(
-        f"loop_specialized_mlp_lora: rank={base_model.mlp_lora_rank} requested_rank={h.mlp_lora_rank} alpha={h.mlp_lora_alpha} layers={base_model.recurrent_indices} adapters={len(base_model.recurrent_mlp_loras)} enable_at={lora_enable_at:.3f}"
+        f"recur_depth_sampling: depths={list(base_model.recur_depths)} eval_depth={h.recur_depth_eval} encoded_ln={int(h.encoded_ln_enabled)} h0_from_encoded={int(base_model.recur_h0_from_encoded)} bptt_tail={base_model.recur_bptt_tail}"
     )
     log(
-        f"mlp_lora_schedule: loop_enable_at={h.enable_looping_at:.3f} loop_settle_frac={h.loop_settle_frac:.3f} enable_at={lora_enable_at:.3f}"
+        f"recur_stability: carry_init={h.recur_carry_init} inject_init={h.recur_input_scale_init} grad_clip={h.grad_clip_norm} logit_softcap={h.logit_softcap}"
     )
     optimizers = Optimizers(h, base_model)
     train_loader = ShuffledSequenceLoader(h, device)
@@ -1509,12 +1401,29 @@ def train_model(h, device, val_data):
             return max((1.0 - frac) / h.warmdown_frac, h.min_lr)
         return 1.0
 
-    def step_fn(step, lr_scale, lora_lr_scale=1.0):
+    depth_options = list(base_model.recur_depths)
+    depth_options_tensor = torch.tensor(depth_options, dtype=torch.int64, device=device)
+    depth_rng = torch.Generator(device=device)
+    depth_rng.manual_seed(h.seed)
+    depth_buf = torch.zeros((), dtype=torch.int64, device=device)
+
+    def sample_depth():
+        if h.is_main_process:
+            idx = torch.randint(len(depth_options), (), device=device, generator=depth_rng,dtype=torch.int64)
+            depth_buf.copy_(depth_options_tensor[idx])
+        if h.distributed:
+            dist.broadcast(depth_buf, src=0)
+        return int(depth_buf.item())
+
+    def step_fn(step, lr_scale, fixed_depth=None):
         optimizers.zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(h.grad_accum_steps):
             if h.distributed:
                 model.require_backward_grad_sync = micro_step == h.grad_accum_steps - 1
+            base_model.recur_depth = (
+                int(fixed_depth) if fixed_depth is not None else sample_depth()
+            )
             x, y = train_loader.next_batch(h.train_batch_tokens, h.grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
@@ -1534,9 +1443,6 @@ def train_model(h, device, val_data):
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * lr_scale
-        if optimizers.optimizer_lora is not None and lora_lr_scale < 1.0:
-            for group in optimizers.optimizer_lora.param_groups:
-                group["lr"] *= lora_lr_scale
         if h.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), h.grad_clip_norm)
         optimizers.step()
@@ -1549,26 +1455,15 @@ def train_model(h, device, val_data):
         initial_optimizer_states = [
             copy.deepcopy(opt.state_dict()) for opt in optimizers
         ]
-
-        def _run_warmup(label):
-            for w in range(h.warmup_steps):
-                step_fn(w, 1.0)
-                if w <= 5 or (w + 1) % 10 == 0 or w + 1 == h.warmup_steps:
-                    log(f"{label}: {w+1}/{h.warmup_steps}")
-
         model.train()
-        _run_warmup("warmup_step")
-        if h.num_recur_loops > 0:
-            base_model.looping_active = True
-            if base_model.recurrent_mlp_loras:
-                base_model.mlp_lora_gain.fill_(1.0)
+        for depth in depth_options:
             log(
-                f"loop_warmup:enabled prelude:{base_model.prelude_indices} recurrent:{base_model.recurrent_indices} postlude:{base_model.postlude_indices} passes:{base_model.num_recur_passes}"
+                f"loop_warmup:depth={depth} prelude:{base_model.prelude_indices} recurrent:{base_model.recurrent_indices} postlude:{base_model.postlude_indices}"
             )
-            _run_warmup("loop_warmup_step")
-            base_model.looping_active = False
-            if base_model.recurrent_mlp_loras:
-                base_model.mlp_lora_gain.fill_(0.0)
+            for w in range(h.warmup_steps):
+                step_fn(w, 1.0, fixed_depth=depth)
+                if w <= 5 or (w + 1) % 10 == 0 or w + 1 == h.warmup_steps:
+                    log(f"loop_warmup_step depth={depth}: {w+1}/{h.warmup_steps}")
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -1585,7 +1480,6 @@ def train_model(h, device, val_data):
     ema_decay = h.ema_decay
     training_time_ms = 0.0
     stop_after_step = None
-    lora_start_step = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     step = 0
@@ -1616,32 +1510,7 @@ def train_model(h, device, val_data):
         elapsed_ms = training_time_ms + 1e3 * (time.perf_counter() - t0)
         frac = training_frac(step, elapsed_ms)
         scale = lr_mul(frac)
-        if (
-            h.num_recur_loops > 0
-            and not base_model.looping_active
-            and frac >= h.enable_looping_at
-        ):
-            base_model.looping_active = True
-            log(
-                f"layer_loop:enabled step:{step} frac:{frac:.3f} prelude:{base_model.prelude_indices} recurrent:{base_model.recurrent_indices} postlude:{base_model.postlude_indices} passes:{base_model.num_recur_passes}"
-            )
-        if (
-            base_model.recurrent_mlp_loras
-            and lora_start_step is None
-            and frac >= lora_enable_at
-        ):
-            lora_start_step = step
-            log(
-                f"mlp_lora:enabled step:{step} frac:{frac:.3f} adapters:{len(base_model.recurrent_mlp_loras)} enable_at:{lora_enable_at:.3f}"
-            )
-        lora_warmup_mul = 1.0
-        if lora_start_step is not None and h.mlp_lora_warmup_steps > 0:
-            lora_warmup_mul = min(1.0, (step - lora_start_step) / h.mlp_lora_warmup_steps)
-        if base_model.recurrent_mlp_loras:
-            base_model.mlp_lora_gain.fill_(
-                lora_warmup_mul if lora_start_step is not None else 0.0
-            )
-        train_loss = step_fn(step, scale, lora_lr_scale=lora_warmup_mul)
+        train_loss = step_fn(step, scale)
         with torch.no_grad():
             current_fp32 = [t.detach().float() for t in ema_source_tensors]
             torch._foreach_mul_(ema_tensors, ema_decay)
@@ -1697,11 +1566,9 @@ def train_and_eval(h, device):
         dist.barrier()
 
     def _activate_eval_features(m):
-        if h.num_recur_loops > 0:
-            m.looping_active = True
-        if m.recurrent_mlp_loras:
-            m.mlp_lora_gain.fill_(1.0)
+        m.recur_depth = h.recur_depth_eval
 
+    base_model.recur_depth = h.recur_depth_eval
     eval_model = deserialize(h, device)
     _activate_eval_features(eval_model)
     compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
@@ -1731,22 +1598,19 @@ def main():
         raise ValueError(
             "MLP_MULT is not configurable in this variant; use PRELUDE_MLP_MULT / RECURRENT_MLP_MULT / POSTLUDE_MLP_MULT."
         )
-    if "MLP_LORA_LAYERS" in os.environ:
-        raise ValueError(
-            "MLP_LORA_LAYERS is not configurable in this variant; LoRA always targets recurrent blocks."
-        )
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-    if h.loop_settle_frac < 0.0:
-        raise ValueError(
-            f"LOOP_SETTLE_FRAC must be non-negative, got {h.loop_settle_frac}"
+    if h.recur_depth_eval not in h.recur_depths:
+        log(
+            f"warning:recur_depth_eval={h.recur_depth_eval} is not in RECUR_DEPTHS={h.recur_depths}; "
+            f"calibration will not have warmed up the eval depth"
         )
     if h.prelude_layers < 0 or h.recurrent_layers <= 0 or h.postlude_layers < 0:
         raise ValueError(
             f"Invalid stage sizes: PRELUDE_LAYERS={h.prelude_layers}, RECURRENT_LAYERS={h.recurrent_layers}, POSTLUDE_LAYERS={h.postlude_layers}"
         )
-    if h.num_recur_loops < 0:
-        raise ValueError(f"NUM_RECUR_LOOPS must be non-negative, got {h.num_recur_loops}")
+    if any(d <= 0 for d in h.recur_depths):
+        raise ValueError(f"RECUR_DEPTHS must be positive, got {h.recur_depths}")
     if not (0.0 < h.recur_carry_init < 1.0):
         raise ValueError(
             f"RECUR_CARRY_INIT must be in (0, 1), got {h.recur_carry_init}"
