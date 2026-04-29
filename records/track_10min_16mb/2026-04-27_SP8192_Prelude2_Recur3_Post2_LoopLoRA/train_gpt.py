@@ -81,6 +81,11 @@ class Hyperparameters:
         int(d) for d in os.environ.get("RECUR_DEPTHS", "2,3,4").split(",") if d.strip()
     )
     recur_depth_eval = int(os.environ.get("RECUR_DEPTH_EVAL", 3))
+    recur_depth_evals = tuple(
+        int(d)
+        for d in os.environ.get("RECUR_DEPTH_EVALS", str(recur_depth_eval)).split(",")
+        if d.strip()
+    )
     recur_carry_init = float(os.environ.get("RECUR_CARRY_INIT", 0.99))
     recur_input_scale_init = float(os.environ.get("RECUR_INPUT_SCALE_INIT", 0.01))
     recur_h0_from_encoded = bool(int(os.environ.get("RECUR_H0_FROM_ENCODED", "1")))
@@ -108,6 +113,7 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.095))
     embed_wd = float(os.environ.get("EMBED_WD", 0.085))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.9965))
+    ema_start_frac = float(os.environ.get("EMA_START_FRAC", 0.0))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.005))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
@@ -1133,7 +1139,8 @@ def _count_bytes(val_data, tgt, prev, dtype=torch.float64):
     return tb
 
 
-def eval_val(h, device, val_data, model):
+def eval_val(h, device, val_data, model, recur_depth=None, max_tokens=None):
+    depth = h.recur_depth_eval if recur_depth is None else int(recur_depth)
     seq_len = h.eval_seq_len
     local_batch_tokens = h.val_batch_tokens // (h.world_size * h.grad_accum_steps)
     if local_batch_tokens < seq_len:
@@ -1144,10 +1151,12 @@ def eval_val(h, device, val_data, model):
     total_tokens = val_data.val_tokens.numel() - 1
     if h.val_max_tokens > 0:
         total_tokens = min(total_tokens, h.val_max_tokens)
+    if max_tokens is not None and max_tokens > 0:
+        total_tokens = min(total_tokens, int(max_tokens))
     total_seqs = total_tokens // seq_len
     if total_seqs < 1:
         raise ValueError(
-            f"VAL_MAX_TOKENS must cover at least one eval sequence; got VAL_MAX_TOKENS={h.val_max_tokens}, EVAL_SEQ_LEN={seq_len}"
+            f"Validation token cap must cover at least one eval sequence; got total_tokens={total_tokens}, EVAL_SEQ_LEN={seq_len}"
         )
     seq_start = total_seqs * h.rank // h.world_size
     seq_end = total_seqs * (h.rank + 1) // h.world_size
@@ -1164,7 +1173,7 @@ def eval_val(h, device, val_data, model):
             x = local[:-1].reshape(-1, seq_len)
             y = local[1:].reshape(-1, seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y, recur_depth=h.recur_depth_eval).detach()
+                batch_loss = model(x, y, recur_depth=depth).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -1229,7 +1238,8 @@ def _score_windowed(
     return loss_sum, token_count, byte_count
 
 
-def eval_val_sliding(h, device, val_data, base_model, batch_seqs=32):
+def eval_val_sliding(h, device, val_data, base_model, batch_seqs=32, recur_depth=None):
+    depth = h.recur_depth_eval if recur_depth is None else int(recur_depth)
     base_model.eval()
     logits_fn = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
     seq_len = h.eval_seq_len
@@ -1253,14 +1263,15 @@ def eval_val_sliding(h, device, val_data, base_model, batch_seqs=32):
             context_size,
             batch_seqs,
             device,
-            recur_depth=h.recur_depth_eval,
+            recur_depth=depth,
         )
     _allreduce_sum(loss_sum, token_count, byte_count)
     base_model.train()
     return _loss_bpb(loss_sum, token_count, byte_count)
 
 
-def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
+def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32, recur_depth=None):
+    depth = h.recur_depth_eval if recur_depth is None else int(recur_depth)
     rank, world_size = h.rank, h.world_size
     seq_len, stride = h.eval_seq_len, h.eval_stride
     total_tokens = val_data.val_tokens.numel() - 1
@@ -1303,7 +1314,7 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
                 context_size,
                 batch_seqs,
                 device,
-                recur_depth=h.recur_depth_eval,
+                recur_depth=depth,
             )
             loss_sum += ls
             token_count += tc
@@ -1336,7 +1347,7 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
                 y = local[1:].reshape(-1, seq_len)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    loss = base_model(x, y, recur_depth=h.recur_depth_eval)
+                    loss = base_model(x, y, recur_depth=depth)
                 loss.backward()
                 if world_size > 1:
                     for p in ttt_params:
@@ -1495,6 +1506,8 @@ def train_model(h, device, val_data):
     ema_tensors = list(ema_state.values())
     ema_source_tensors = list(base_model.state_dict().values())
     ema_decay = h.ema_decay
+    ema_started = False
+    ema_updates = 0
     training_time_ms = 0.0
     stop_after_step = None
     torch.cuda.synchronize()
@@ -1528,12 +1541,23 @@ def train_model(h, device, val_data):
         frac = training_frac(step, elapsed_ms)
         scale = lr_mul(frac)
         train_loss = step_fn(step, scale)
-        with torch.no_grad():
-            current_fp32 = [t.detach().float() for t in ema_source_tensors]
-            torch._foreach_mul_(ema_tensors, ema_decay)
-            torch._foreach_add_(ema_tensors, current_fp32, alpha=1.0 - ema_decay)
         step += 1
         approx_training_time_ms = training_time_ms + 1e3 * (time.perf_counter() - t0)
+        if ema_decay > 0.0:
+            ema_frac = training_frac(step, approx_training_time_ms)
+            if ema_frac >= h.ema_start_frac:
+                with torch.no_grad():
+                    current_fp32 = [t.detach().float() for t in ema_source_tensors]
+                    if not ema_started:
+                        for ema_t, cur_t in zip(ema_tensors, current_fp32, strict=True):
+                            ema_t.copy_(cur_t)
+                        ema_started = True
+                    else:
+                        torch._foreach_mul_(ema_tensors, ema_decay)
+                        torch._foreach_add_(
+                            ema_tensors, current_fp32, alpha=1.0 - ema_decay
+                        )
+                ema_updates += 1
         should_log_train = h.train_log_every > 0 and (
             step <= 5 or step % h.train_log_every == 0 or stop_after_step is not None
         )
@@ -1554,12 +1578,19 @@ def train_model(h, device, val_data):
     log(
         f"peak memory allocated: {torch.cuda.max_memory_allocated()//1024//1024} MiB reserved: {torch.cuda.max_memory_reserved()//1024//1024} MiB"
     )
-    log("ema:applying EMA weights")
-    current_state = base_model.state_dict()
-    avg_state = {
-        name: t.to(dtype=current_state[name].dtype) for (name, t) in ema_state.items()
-    }
-    base_model.load_state_dict(avg_state, strict=True)
+    if ema_decay > 0.0 and ema_updates > 0:
+        log(
+            f"ema:applying EMA weights (start_frac={h.ema_start_frac:.3f}, updates={ema_updates})"
+        )
+        current_state = base_model.state_dict()
+        avg_state = {
+            name: t.to(dtype=current_state[name].dtype) for (name, t) in ema_state.items()
+        }
+        base_model.load_state_dict(avg_state, strict=True)
+    else:
+        log(
+            f"ema:skip_apply (decay={ema_decay}, start_frac={h.ema_start_frac:.3f}, updates={ema_updates})"
+        )
     return base_model, compiled_model
 
 
@@ -1575,31 +1606,59 @@ def train_and_eval(h, device):
     log(f"val_tokens: {val_data.val_tokens.numel()-1}")
     base_model, compiled_model = train_model(h, device, val_data)
     torch._dynamo.reset()
-    timed_eval(
-        "pre-quantization post-ema", eval_val, h, device, val_data, compiled_model
-    )
+    eval_depths = list(dict.fromkeys(int(d) for d in h.recur_depth_evals))
+    for depth in eval_depths:
+        timed_eval(
+            f"pre-quantization post-ema depth={depth}",
+            eval_val,
+            h,
+            device,
+            val_data,
+            compiled_model,
+            recur_depth=depth,
+        )
     serialize(h, base_model, Path(__file__).read_text(encoding="utf-8"))
     if h.distributed:
         dist.barrier()
 
     eval_model = deserialize(h, device)
     compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
-    timed_eval("quantized", eval_val, h, device, val_data, compiled_model)
-    if h.sliding_window_enabled:
+    for depth in eval_depths:
         timed_eval(
-            "quantized_sliding_window",
-            eval_val_sliding,
+            f"quantized depth={depth}",
+            eval_val,
             h,
             device,
             val_data,
-            eval_model,
+            compiled_model,
+            recur_depth=depth,
         )
+    if h.sliding_window_enabled:
+        for depth in eval_depths:
+            timed_eval(
+                f"quantized_sliding_window depth={depth}",
+                eval_val_sliding,
+                h,
+                device,
+                val_data,
+                eval_model,
+                recur_depth=depth,
+            )
     if h.ttt_enabled and h.sliding_window_enabled:
         del eval_model, compiled_model
         torch._dynamo.reset()
         torch.cuda.empty_cache()
         ttt_model = deserialize(h, device)
-        timed_eval("quantized_ttt", eval_val_ttt, h, device, val_data, ttt_model)
+        for depth in eval_depths:
+            timed_eval(
+                f"quantized_ttt depth={depth}",
+                eval_val_ttt,
+                h,
+                device,
+                val_data,
+                ttt_model,
+                recur_depth=depth,
+            )
         del ttt_model
 
 
@@ -1614,7 +1673,7 @@ def main():
     if h.recur_depth_eval not in h.recur_depths:
         log(
             f"warning:recur_depth_eval={h.recur_depth_eval} is not in RECUR_DEPTHS={h.recur_depths}; "
-            f"warmup includes eval depth, GPTQ calibrates only at eval depth"
+            f"warmup includes eval depth, GPTQ calibrates only at recur_depth_eval"
         )
     if h.prelude_layers < 0 or h.recurrent_layers <= 0 or h.postlude_layers < 0:
         raise ValueError(
@@ -1650,6 +1709,15 @@ def main():
         raise ValueError(
             f"POSTLUDE_MLP_MULT*MODEL_DIM must be >= 1, got {h.postlude_mlp_mult * h.model_dim}"
         )
+    if not (0.0 <= h.ema_start_frac <= 1.0):
+        raise ValueError(f"EMA_START_FRAC must be in [0, 1], got {h.ema_start_frac}")
+    if any(d <= 0 for d in h.recur_depth_evals):
+        raise ValueError(f"RECUR_DEPTH_EVALS must be positive, got {h.recur_depth_evals}")
+    for d in h.recur_depth_evals:
+        if d not in h.recur_depths:
+            log(
+                f"warning:recur_depth_eval depth {d} not in RECUR_DEPTHS={h.recur_depths}; will still run eval at this depth"
+            )
     if h.world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {h.world_size}")
     if 8 % h.world_size != 0:
