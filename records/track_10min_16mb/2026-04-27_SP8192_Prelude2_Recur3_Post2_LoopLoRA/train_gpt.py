@@ -101,6 +101,7 @@ class Hyperparameters:
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.02))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
+    polar_express_ns = bool(int(os.environ.get("POLAR_EXPRESS_NS", "0")))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
     muon_row_normalize = bool(int(os.environ.get("MUON_ROW_NORMALIZE", "1")))
@@ -643,14 +644,26 @@ def classify_param(name):
 
 
 @torch.compile
-def zeropower_via_newtonschulz5(G, steps=10, eps=1e-07):
-    a, b, c = 3.4445, -4.775, 2.0315
+def zeropower_via_newtonschulz5(G, steps=10, eps=1e-07, polar_express=False):
+    default_coeff = (3.4445, -4.775, 2.0315)
+    # Five-step per-iteration coefficients from Dao-AILab's Polar Express Muon notes.
+    polar_coeffs = (
+        (4.0848, -6.8946, 2.9270),
+        (3.9505, -6.3029, 2.6377),
+        (3.7418, -5.5913, 2.3037),
+        (2.8769, -3.1427, 1.2046),
+        (2.8366, -3.0525, 1.2012),
+    )
     X = G.bfloat16()
     X /= X.norm() + eps
     transposed = G.size(0) > G.size(1)
     if transposed:
         X = X.T
-    for _ in range(steps):
+    for i in range(steps):
+        if polar_express and i < len(polar_coeffs):
+            a, b, c = polar_coeffs[i]
+        else:
+            a, b, c = default_coeff
         A = X @ X.T
         B = b * A + c * A @ A
         X = a * X + B @ X
@@ -664,6 +677,7 @@ class Muon(torch.optim.Optimizer):
         lr,
         momentum,
         backend_steps,
+        polar_express_ns=False,
         nesterov=True,
         weight_decay=0.0,
         row_normalize=False,
@@ -674,6 +688,7 @@ class Muon(torch.optim.Optimizer):
                 lr=lr,
                 momentum=momentum,
                 backend_steps=backend_steps,
+                polar_express_ns=polar_express_ns,
                 nesterov=nesterov,
                 weight_decay=weight_decay,
                 row_normalize=row_normalize,
@@ -696,6 +711,7 @@ class Muon(torch.optim.Optimizer):
             lr = group["lr"]
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
+            polar_express_ns = group.get("polar_express_ns", False)
             nesterov = group["nesterov"]
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(
@@ -717,7 +733,9 @@ class Muon(torch.optim.Optimizer):
                             g.float().norm(dim=-1, keepdim=True).clamp_min(1e-07)
                         )
                         g = g / row_norms.to(g.dtype)
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                    g = zeropower_via_newtonschulz5(
+                        g, steps=backend_steps, polar_express=polar_express_ns
+                    )
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
@@ -777,6 +795,7 @@ class Optimizers:
             lr=h.matrix_lr,
             momentum=h.muon_momentum,
             backend_steps=h.muon_backend_steps,
+            polar_express_ns=h.polar_express_ns,
             weight_decay=h.muon_wd,
             row_normalize=h.muon_row_normalize,
         )
@@ -1395,6 +1414,9 @@ def train_model(h, device, val_data):
     )
     log(
         f"recur_stability: carry_init={h.recur_carry_init} inject_init={h.recur_input_scale_init} grad_clip={h.grad_clip_norm} logit_softcap={h.logit_softcap}"
+    )
+    log(
+        f"muon_ns_mode: polar_express_ns={int(h.polar_express_ns)} backend_steps={h.muon_backend_steps}"
     )
     optimizers = Optimizers(h, base_model)
     train_loader = ShuffledSequenceLoader(h, device)
