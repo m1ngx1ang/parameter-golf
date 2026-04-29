@@ -1603,7 +1603,7 @@ def main():
     if h.recur_depth_eval not in h.recur_depths:
         log(
             f"warning:recur_depth_eval={h.recur_depth_eval} is not in RECUR_DEPTHS={h.recur_depths}; "
-            f"calibration will not have warmed up the eval depth"
+            f"warmup includes eval depth, but GPTQ calibration cycles only RECUR_DEPTHS"
         )
     if h.prelude_layers < 0 or h.recurrent_layers <= 0 or h.postlude_layers < 0:
         raise ValueError(
