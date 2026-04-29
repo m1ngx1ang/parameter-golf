@@ -865,13 +865,12 @@ def collect_hessians(model, train_loader, h, device, n_calibration_batches=64):
             )
         )
     model.eval()
-    depths = list(model.recur_depths) or [int(model.recur_depth)]
-    log(f"GPTQ:calibrating over recur_depths={depths} batches={n_calibration_batches}")
+    depth_eval = int(getattr(h, "recur_depth_eval", model.recur_depth))
+    log(f"GPTQ:calibrating at recur_depth_eval={depth_eval} batches={n_calibration_batches}")
     with torch.no_grad():
         for i in range(n_calibration_batches):
-            depth = depths[i % len(depths)]
             x, _ = train_loader.next_batch(h.train_batch_tokens, h.grad_accum_steps)
-            model.forward_logits(x, recur_depth=depth)
+            model.forward_logits(x, recur_depth=depth_eval)
     for hook in hooks:
         hook.remove()
     for name in hessians:
@@ -1615,7 +1614,7 @@ def main():
     if h.recur_depth_eval not in h.recur_depths:
         log(
             f"warning:recur_depth_eval={h.recur_depth_eval} is not in RECUR_DEPTHS={h.recur_depths}; "
-            f"warmup includes eval depth, but GPTQ calibration cycles only RECUR_DEPTHS"
+            f"warmup includes eval depth, GPTQ calibrates only at eval depth"
         )
     if h.prelude_layers < 0 or h.recurrent_layers <= 0 or h.postlude_layers < 0:
         raise ValueError(
