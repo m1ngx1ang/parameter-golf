@@ -1,65 +1,74 @@
-# SP8192 Prelude2-Recur3-Post2 Loop LoRA
+# SP8192 Looped Transformer (Parcae-style)
 
-This record tests a stage-structured depth-recurrent architecture while keeping the existing SP8192 `Block` implementation.
+Stage-structured looped transformer adapted from arXiv:2604.12946 (Parcae). Reuses the
+existing SP8192 `Block` (pre-norm transformer with `resid_mix` anchor) — no new modules
+introduced. The recurrent "block" is a chain of plain transformer blocks; depth is
+randomized per microbatch.
 
 ## Architecture
 
-Default physical layout is `2 + 3 + 2` layers:
+Default physical layout `2 + 3 + 2`:
 
-- Prelude: layers `0,1` (run once)
-- Recurrent core: layers `2,3,4` (run `NUM_RECUR_LOOPS + 1` passes when looping is enabled)
-- Postlude: layers `5,6` (run once)
+- Prelude: blocks `0..1` (run once, anchor `x0 = post-embed rms_norm`)
+- `encoded = LN(prelude_output)` (RMSNorm — paper's `e = LN(P(s))` for stability)
+- Recurrent block: blocks `2..4` chained (looped `T` times; T sampled per microbatch)
+- Postlude: blocks `5..6` (run once with U-Net skips back to prelude)
 
-Key behaviors:
+Recurrent loop body, applied for `t = 0 ... T-1` (paper formula
+`x_{t+1} = decay·x_t + inject·e + R̄(x_t,e)` realized as
+`x_{t+1} = R̄(decay·x_t + inject·e)` since pre-norm blocks emit the `+R̄(·)` term
+through their residual stream):
 
-- U-net bridge between Prelude and Postlude is kept (`skip_weights` + `skip_gates`) for gradient flow.
-- Recurrent update uses both previous hidden state and encoded prelude input:
-  - `h_next = A*h_prev + B*e + core(h_prev, e)`
-  - `A` is constrained to `(0,1)` via `recur_carry_log`.
-  - `B` is learned via `recur_input_scale`.
-- Block residual mixing uses baseline-style `resid_mix` (no `stable_resid_mix` branch).
-- LoRA is applied to MLP input projection (`fc`) in recurrent blocks, specialized per `(loop_pass, recurrent_block)`.
+```
+h ← carry · h + inject · encoded                        # adapter
+x0 ← h                                                   # block anchor inside recurrent stack
+for i in recurrent_indices:
+    h ← Block_i(h, x0)                                  # plain transformer chain
+```
 
-## Default Knobs
+- `carry = exp(-exp(recur_carry_log))` ∈ (0, 1) per channel — the diagonal A
+- `inject = recur_input_scale` per channel — the B-projection scalar
+- `h_0 = encoded` (default) or zeros, controlled by `RECUR_H0_FROM_ENCODED`
 
-- `PRELUDE_LAYERS=2`
-- `RECURRENT_LAYERS=3`
-- `POSTLUDE_LAYERS=2`
-- `NUM_RECUR_LOOPS=2`
-- `ENABLE_LOOPING_AT=0.35`
-- `LOOP_SETTLE_FRAC=0.10`
-- `RECUR_CARRY_INIT=0.99`
-- `RECUR_INPUT_SCALE_INIT=0.0`
-- `PRELUDE_MLP_MULT=4.0`
-- `RECURRENT_MLP_MULT=6.0`
-- `POSTLUDE_MLP_MULT=4.0`
-- `MLP_LORA_RANK=8`
-- `MLP_LORA_ALPHA=8.0`
-- `MLP_LORA_LR=0.02`
-- `MLP_LORA_WD=0.0`
-- `MLP_LORA_WARMUP_STEPS=400`
+U-net skip bridges between Prelude and Postlude (`skip_weights` + `skip_gates`) are
+preserved.
 
-`NUM_LAYERS` is derived internally as `PRELUDE_LAYERS + RECURRENT_LAYERS + POSTLUDE_LAYERS` and is no longer configured directly.
-LoRA placement is fixed to recurrent physical blocks only.
-`MLP_MULT` is removed in this variant; use stage-specific multipliers.
+## Random recurrent depth
 
-## Multiplier Budget Notes
+Depth `T` is sampled per microbatch from `RECUR_DEPTHS` (default `2,3,4`). The full
+microbatch schedule for one optimizer step is sampled once on rank 0 using a dedicated,
+seeded `torch.Generator`, broadcast as a `[grad_accum_steps]` tensor to every rank, and
+materialized into a Python list with a single GPU→CPU sync. Depth then flows into the
+model as an explicit `recur_depth` kwarg on `forward()` / `forward_logits()`, so
+`torch.compile(dynamic=False, fullgraph=True)` specializes one cached graph per depth
+value.
 
-With this 7-layer physical layout, we can afford a larger recurrent MLP while keeping pre/post conservative:
+Warmup runs `WARMUP_STEPS` steps at each unique depth in `RECUR_DEPTHS ∪ {RECUR_DEPTH_EVAL}`,
+so every depth is compiled before real training begins. Model and optimizer state are
+restored from a CPU snapshot after warmup.
 
-- `PRELUDE/POSTLUDE=4, RECURRENT=6`: recommended default.
-- `PRELUDE/POSTLUDE=4, RECURRENT=8`: aggressive, budget-risky.
+Eval (pre-quant, post-quant, sliding-window, TTT) uses a fixed `recur_depth = RECUR_DEPTH_EVAL`
+(default 3).
 
-Rough model-size trend from this folder's architecture:
+## Quantization-aware calibration
 
-- `4/4/4`: ~24.6M params
-- `4/6/4`: ~32.0M params
-- `4/8/4`: ~39.4M params
+`collect_hessians` cycles `recur_depth` through `RECUR_DEPTHS` round-robin during
+calibration so the Hessians average activation distributions across the depths the
+quantized model will see at eval.
 
-Suggested sweep order under tight compute credit:
+## Default knobs
 
-1. `RECURRENT_MLP_MULT=6` with defaults
-2. `RECURRENT_MLP_MULT=8` only if step 1 remains comfortably under artifact/time budgets
+- `PRELUDE_LAYERS=2`, `RECURRENT_LAYERS=3`, `POSTLUDE_LAYERS=2`
+- `PRELUDE_MLP_MULT=4.0`, `RECURRENT_MLP_MULT=4.0`, `POSTLUDE_MLP_MULT=4.0`
+- `RECUR_DEPTHS=2,3,4`, `RECUR_DEPTH_EVAL=3`
+- `RECUR_CARRY_INIT=0.99`, `RECUR_INPUT_SCALE_INIT=0.01`
+- `RECUR_H0_FROM_ENCODED=1`, `RECUR_BPTT_TAIL=0` (full BPTT)
+- `ENCODED_LN_ENABLED=1`
+- `PARALLEL_RESIDUAL_START=5`
+
+`MLP_MULT` is removed in this variant (use stage-specific multipliers). All LoRA
+knobs (`MLP_LORA_*`) and the dual-loop knobs (`NUM_RECUR_LOOPS`, `ENABLE_LOOPING_AT`,
+`LOOP_SETTLE_FRAC`) are gone.
 
 ## Training
 
@@ -69,23 +78,11 @@ Full run:
 SEED=42 torchrun --standalone --nproc_per_node=8 train_gpt.py
 ```
 
-Recommended run (default stage multipliers):
-
-```bash
-SEED=42 torchrun --standalone --nproc_per_node=8 train_gpt.py
-```
-
-Aggressive run (budget-risky):
-
-```bash
-SEED=42 RECURRENT_MLP_MULT=8 torchrun --standalone --nproc_per_node=8 train_gpt.py
-```
-
 Short smoke (single GPU):
 
 ```bash
 DATA_DIR=/home/max/parameter-golf/data \
-RUN_ID=sp8192_pre2_rec3_post2_smoke \
+RUN_ID=sp8192_looped_smoke \
 SEED=42 \
 ITERATIONS=200 \
 WARMUP_STEPS=0 \
@@ -113,5 +110,5 @@ Outputs:
 
 - `logs/<RUN_ID>.txt`
 - `final_model.pt`
-- `final_model.int6.ptz`
+- `final_model.int${MATRIX_BITS}.ptz` (e.g. `final_model.int6.ptz` with `MATRIX_BITS=6`)
 - runpod-collected artifacts under `artifacts/`

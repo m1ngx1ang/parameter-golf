@@ -96,9 +96,7 @@ class Hyperparameters:
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.02))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_momentum_warmup_start = float(
-        os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92)
-    )
+    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
     muon_row_normalize = bool(int(os.environ.get("MUON_ROW_NORMALIZE", "1")))
     beta1 = float(os.environ.get("BETA1", 0.9))
@@ -131,12 +129,10 @@ class Hyperparameters:
     datasets_dir = os.path.join(data_dir, "datasets", f"fineweb10B_sp{vocab_size}")
     train_files = os.path.join(datasets_dir, "fineweb_train_*.bin")
     val_files = os.path.join(datasets_dir, "fineweb_val_*.bin")
-    tokenizer_path = os.path.join(
-        data_dir, "tokenizers", f"fineweb_{vocab_size}_bpe.model"
-    )
+    tokenizer_path = os.path.join(data_dir, "tokenizers", f"fineweb_{vocab_size}_bpe.model")
     logfile = f"logs/{run_id}.txt"
     model_path = "final_model.pt"
-    quantized_model_path = "final_model.int6.ptz"
+    quantized_model_path = f"final_model.int{matrix_bits}.ptz"
 
 
 _logger_hparams = None
@@ -587,7 +583,8 @@ class GPT(nn.Module):
                 ):
                     nn.init.orthogonal_(module.weight, gain=1.0)
 
-    def forward_logits(self, input_ids):
+    def forward_logits(self, input_ids, recur_depth=None):
+        depth = int(recur_depth) if recur_depth is not None else int(self.recur_depth)
         x = F.rms_norm(self.tok_emb(input_ids), (self.tok_emb.weight.size(1),))
         input_anchor = x
         skips = []
@@ -597,18 +594,16 @@ class GPT(nn.Module):
         encoded = self.encoded_ln(x) if self.encoded_ln is not None else x
         carry = torch.exp(-torch.exp(self.recur_carry_log.clamp(-20, 20))).to(x.dtype)
         inject = self.recur_input_scale.to(x.dtype)
-        h_state = encoded if self.recur_h0_from_encoded else torch.zeros_like(encoded)
-        depth = self.recur_depth
-        bptt_tail = self.recur_bptt_tail if self.recur_bptt_tail > 0 else depth
-        detach_until = max(0, depth - bptt_tail)
+        h = encoded if self.recur_h0_from_encoded else torch.zeros_like(encoded)
+        detach_at = depth - self.recur_bptt_tail if self.recur_bptt_tail > 0 else 0
         for t in range(depth):
-            if t == detach_until and detach_until > 0:
-                h_state = h_state.detach()
-            core = h_state
+            if t == detach_at and detach_at > 0:
+                h = h.detach()
+            h = carry * h + inject * encoded
+            x0 = h
             for i in self.recurrent_indices:
-                core = self.blocks[i](core, encoded)
-            h_state = carry * h_state + inject * encoded + core
-        x = h_state
+                h = self.blocks[i](h, x0)
+        x = h
         for skip_idx, i in enumerate(self.postlude_indices):
             if skip_idx < self.num_skip_weights and skips:
                 scaled_skip = self.skip_weights[skip_idx].to(x.dtype) * skips.pop()
@@ -622,8 +617,8 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-    def forward(self, input_ids, target_ids):
-        logits = self.forward_logits(input_ids)
+    def forward(self, input_ids, target_ids, recur_depth=None):
+        logits = self.forward_logits(input_ids, recur_depth=recur_depth)
         return F.cross_entropy(
             logits.reshape(-1, logits.size(-1)).float(),
             target_ids.reshape(-1),
@@ -805,6 +800,14 @@ class Optimizers:
             self.optimizers.insert(1, self.optimizer_head)
         else:
             self.optimizer_head = None
+        owned_ids = {
+            id(p) for opt in self.optimizers for g in opt.param_groups for p in g["params"]
+        }
+        unowned = [n for (n, p) in base_model.named_parameters() if id(p) not in owned_ids]
+        if unowned:
+            log(
+                f"warning:Optimizers missing {len(unowned)} parameter(s) — these will not be trained: {unowned}"
+            )
 
     def __iter__(self):
         return iter(self.optimizers)
@@ -862,15 +865,13 @@ def collect_hessians(model, train_loader, h, device, n_calibration_batches=64):
             )
         )
     model.eval()
-    saved_depth = model.recur_depth
-    depths = list(model.recur_depths) or [saved_depth]
+    depths = list(model.recur_depths) or [int(model.recur_depth)]
     log(f"GPTQ:calibrating over recur_depths={depths} batches={n_calibration_batches}")
     with torch.no_grad():
         for i in range(n_calibration_batches):
-            model.recur_depth = depths[i % len(depths)]
+            depth = depths[i % len(depths)]
             x, _ = train_loader.next_batch(h.train_batch_tokens, h.grad_accum_steps)
-            model.forward_logits(x)
-    model.recur_depth = saved_depth
+            model.forward_logits(x, recur_depth=depth)
     for hook in hooks:
         hook.remove()
     for name in hessians:
@@ -1164,7 +1165,7 @@ def eval_val(h, device, val_data, model):
             x = local[:-1].reshape(-1, seq_len)
             y = local[1:].reshape(-1, seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
+                batch_loss = model(x, y, recur_depth=h.recur_depth_eval).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -1198,6 +1199,7 @@ def _score_windowed(
     context_size,
     batch_seqs,
     device,
+    recur_depth=None,
 ):
     loss_sum, token_count, byte_count = _zero_accumulators(device)
     for bi in range(0, len(my_windows), batch_seqs):
@@ -1207,7 +1209,11 @@ def _score_windowed(
             val_data, batch_ws, seq_len, total_tokens, device
         )
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits = logits_fn(x_batch)
+            logits = (
+                logits_fn(x_batch, recur_depth=recur_depth)
+                if recur_depth is not None
+                else logits_fn(x_batch)
+            )
         nll = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)).float(),
             y_batch.reshape(-1),
@@ -1248,6 +1254,7 @@ def eval_val_sliding(h, device, val_data, base_model, batch_seqs=32):
             context_size,
             batch_seqs,
             device,
+            recur_depth=h.recur_depth_eval,
         )
     _allreduce_sum(loss_sum, token_count, byte_count)
     base_model.train()
@@ -1297,6 +1304,7 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
                 context_size,
                 batch_seqs,
                 device,
+                recur_depth=h.recur_depth_eval,
             )
             loss_sum += ls
             token_count += tc
@@ -1329,7 +1337,7 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
                 y = local[1:].reshape(-1, seq_len)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    loss = base_model(x, y)
+                    loss = base_model(x, y, recur_depth=h.recur_depth_eval)
                 loss.backward()
                 if world_size > 1:
                     for p in ttt_params:
@@ -1405,28 +1413,37 @@ def train_model(h, device, val_data):
     depth_options_tensor = torch.tensor(depth_options, dtype=torch.int64, device=device)
     depth_rng = torch.Generator(device=device)
     depth_rng.manual_seed(h.seed)
-    depth_buf = torch.zeros((), dtype=torch.int64, device=device)
+    depth_buf = torch.zeros(h.grad_accum_steps, dtype=torch.int64, device=device)
 
-    def sample_depth():
+    def sample_step_depths():
         if h.is_main_process:
-            idx = torch.randint(len(depth_options), (), device=device, generator=depth_rng,dtype=torch.int64)
+            idx = torch.randint(
+                len(depth_options),
+                (h.grad_accum_steps,),
+                device=device,
+                generator=depth_rng,
+                dtype=torch.int64,
+            )
             depth_buf.copy_(depth_options_tensor[idx])
         if h.distributed:
             dist.broadcast(depth_buf, src=0)
-        return int(depth_buf.item())
+        return depth_buf.tolist()
 
     def step_fn(step, lr_scale, fixed_depth=None):
         optimizers.zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        depths_for_step = (
+            [int(fixed_depth)] * h.grad_accum_steps
+            if fixed_depth is not None
+            else sample_step_depths()
+        )
         for micro_step in range(h.grad_accum_steps):
             if h.distributed:
                 model.require_backward_grad_sync = micro_step == h.grad_accum_steps - 1
-            base_model.recur_depth = (
-                int(fixed_depth) if fixed_depth is not None else sample_depth()
-            )
+            depth = depths_for_step[micro_step]
             x, y = train_loader.next_batch(h.train_batch_tokens, h.grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                loss = model(x, y, recur_depth=depth)
             train_loss += loss.detach()
             (loss / h.grad_accum_steps).backward()
         train_loss /= h.grad_accum_steps
@@ -1456,7 +1473,8 @@ def train_model(h, device, val_data):
             copy.deepcopy(opt.state_dict()) for opt in optimizers
         ]
         model.train()
-        for depth in depth_options:
+        warmup_depths = list(dict.fromkeys(depth_options + [int(h.recur_depth_eval)]))
+        for depth in warmup_depths:
             log(
                 f"loop_warmup:depth={depth} prelude:{base_model.prelude_indices} recurrent:{base_model.recurrent_indices} postlude:{base_model.postlude_indices}"
             )
@@ -1565,12 +1583,7 @@ def train_and_eval(h, device):
     if h.distributed:
         dist.barrier()
 
-    def _activate_eval_features(m):
-        m.recur_depth = h.recur_depth_eval
-
-    base_model.recur_depth = h.recur_depth_eval
     eval_model = deserialize(h, device)
-    _activate_eval_features(eval_model)
     compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
     timed_eval("quantized", eval_val, h, device, val_data, compiled_model)
     if h.sliding_window_enabled:
@@ -1587,7 +1600,6 @@ def train_and_eval(h, device):
         torch._dynamo.reset()
         torch.cuda.empty_cache()
         ttt_model = deserialize(h, device)
-        _activate_eval_features(ttt_model)
         timed_eval("quantized_ttt", eval_val_ttt, h, device, val_data, ttt_model)
         del ttt_model
 
