@@ -1207,8 +1207,14 @@ def eval_val(h, device, val_data, model, recur_depth=None, max_tokens=None):
     return _loss_bpb(val_loss_sum, val_token_count, val_byte_count)
 
 
-def _build_window_batch(val_data, batch_ws, seq_len, total_tokens, device):
-    bsz = len(batch_ws)
+def _build_window_batch(
+    val_data, batch_ws, seq_len, total_tokens, device, padded_batch_seqs=None
+):
+    bsz = len(batch_ws) if padded_batch_seqs is None else int(padded_batch_seqs)
+    if bsz < len(batch_ws):
+        raise ValueError(
+            f"padded_batch_seqs={padded_batch_seqs} must cover {len(batch_ws)} windows"
+        )
     x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
     y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
     wlens = []
@@ -1236,9 +1242,14 @@ def _score_windowed(
     loss_sum, token_count, byte_count = _zero_accumulators(device)
     for bi in range(0, len(my_windows), batch_seqs):
         batch_ws = my_windows[bi : bi + batch_seqs]
-        bsz = len(batch_ws)
+        # Keep torch.compile inputs at a stable batch shape; padded rows are ignored below.
         x_batch, y_batch, wlens = _build_window_batch(
-            val_data, batch_ws, seq_len, total_tokens, device
+            val_data,
+            batch_ws,
+            seq_len,
+            total_tokens,
+            device,
+            padded_batch_seqs=batch_seqs,
         )
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             logits = (
@@ -1247,10 +1258,10 @@ def _score_windowed(
                 else logits_fn(x_batch)
             )
         nll = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)).float(),
-            y_batch.reshape(-1),
+            logits[: len(batch_ws)].reshape(-1, logits.size(-1)).float(),
+            y_batch[: len(batch_ws)].reshape(-1),
             reduction="none",
-        ).reshape(bsz, seq_len)
+        ).reshape(len(batch_ws), seq_len)
         for i, ws in enumerate(batch_ws):
             wlen = wlens[i]
             s = 0 if ws == 0 else context_size
@@ -1269,11 +1280,17 @@ def eval_val_sliding(h, device, val_data, base_model, batch_seqs=32, recur_depth
     seq_len = h.eval_seq_len
     context_size = seq_len - h.eval_stride
     total_tokens = val_data.val_tokens.numel() - 1
+    if h.val_max_tokens > 0:
+        total_tokens = min(total_tokens, h.val_max_tokens)
     window_starts = [
         ws
         for ws in range(0, total_tokens, h.eval_stride)
         if ws + context_size < total_tokens
     ]
+    if not window_starts:
+        raise ValueError(
+            f"Sliding validation token cap must cover at least one scored window; got total_tokens={total_tokens}, EVAL_SEQ_LEN={seq_len}, EVAL_STRIDE={h.eval_stride}"
+        )
     total_windows = len(window_starts)
     my_s = total_windows * h.rank // h.world_size
     my_e = total_windows * (h.rank + 1) // h.world_size
@@ -1299,11 +1316,17 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32, recur_depth=Non
     rank, world_size = h.rank, h.world_size
     seq_len, stride = h.eval_seq_len, h.eval_stride
     total_tokens = val_data.val_tokens.numel() - 1
+    if h.val_max_tokens > 0:
+        total_tokens = min(total_tokens, h.val_max_tokens)
     ttt_chunk = h.ttt_chunk_tokens
     context_size = seq_len - stride
     window_starts = [
         ws for ws in range(0, total_tokens, stride) if ws + context_size < total_tokens
     ]
+    if not window_starts:
+        raise ValueError(
+            f"TTT validation token cap must cover at least one scored window; got total_tokens={total_tokens}, EVAL_SEQ_LEN={seq_len}, EVAL_STRIDE={stride}"
+        )
     num_chunks = (total_tokens + ttt_chunk - 1) // ttt_chunk
     chunk_windows = [[] for _ in range(num_chunks)]
     for ws in window_starts:
@@ -1357,26 +1380,32 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32, recur_depth=Non
         my_seq_s = chunk_seqs * rank // world_size
         my_seq_e = chunk_seqs * (rank + 1) // world_size
         my_chunk_seqs = my_seq_e - my_seq_s
+        max_local_seqs = (chunk_seqs + world_size - 1) // world_size
+        train_batches = (max_local_seqs + batch_seqs - 1) // batch_seqs
         for _ in range(h.ttt_epochs):
-            for bs in range(0, my_chunk_seqs, batch_seqs):
+            for train_bi in range(train_batches):
+                bs = train_bi * batch_seqs
                 be = min(bs + batch_seqs, my_chunk_seqs)
-                start_tok = chunk_start + (my_seq_s + bs) * seq_len
-                end_tok = chunk_start + (my_seq_s + be) * seq_len + 1
-                if end_tok > val_data.val_tokens.numel():
-                    continue
-                local = val_data.val_tokens[start_tok:end_tok].to(
-                    device=device, dtype=torch.int64
-                )
-                x = local[:-1].reshape(-1, seq_len)
-                y = local[1:].reshape(-1, seq_len)
                 optimizer.zero_grad(set_to_none=True)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    loss = base_model(x, y, recur_depth=depth)
-                loss.backward()
+                if bs < my_chunk_seqs:
+                    start_tok = chunk_start + (my_seq_s + bs) * seq_len
+                    end_tok = chunk_start + (my_seq_s + be) * seq_len + 1
+                    if end_tok <= val_data.val_tokens.numel():
+                        local = val_data.val_tokens[start_tok:end_tok].to(
+                            device=device, dtype=torch.int64
+                        )
+                        x = local[:-1].reshape(-1, seq_len)
+                        y = local[1:].reshape(-1, seq_len)
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            loss = base_model(x, y, recur_depth=depth)
+                        loss.backward()
                 if world_size > 1:
                     for p in ttt_params:
-                        if p.grad is not None:
-                            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                        if p.grad is None:
+                            p.grad = torch.zeros_like(
+                                p, memory_format=torch.preserve_format
+                            )
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
                 torch.nn.utils.clip_grad_norm_(ttt_params, 1.0)
                 optimizer.step()
     _allreduce_sum(loss_sum, token_count, byte_count)
@@ -1704,8 +1733,8 @@ def train_and_eval(h, device):
         del eval_model, compiled_model
         torch._dynamo.reset()
         torch.cuda.empty_cache()
-        ttt_model = deserialize(h, device)
         for depth in eval_depths:
+            ttt_model = deserialize(h, device)
             timed_eval(
                 f"quantized_ttt depth={depth}",
                 eval_val_ttt,
@@ -1715,7 +1744,9 @@ def train_and_eval(h, device):
                 ttt_model,
                 recur_depth=depth,
             )
-        del ttt_model
+            del ttt_model
+            torch._dynamo.reset()
+            torch.cuda.empty_cache()
 
 
 def main():
@@ -1780,6 +1811,16 @@ def main():
         )
     if not (0.0 <= h.ema_start_frac <= 1.0):
         raise ValueError(f"EMA_START_FRAC must be in [0, 1], got {h.ema_start_frac}")
+    if h.eval_seq_len <= 0:
+        raise ValueError(f"EVAL_SEQ_LEN must be positive, got {h.eval_seq_len}")
+    if h.eval_stride <= 0 or h.eval_stride > h.eval_seq_len:
+        raise ValueError(
+            f"EVAL_STRIDE must be in [1, EVAL_SEQ_LEN], got EVAL_STRIDE={h.eval_stride}, EVAL_SEQ_LEN={h.eval_seq_len}"
+        )
+    if h.ttt_enabled and h.ttt_chunk_tokens < h.eval_seq_len:
+        raise ValueError(
+            f"TTT_CHUNK_TOKENS must be at least EVAL_SEQ_LEN when TTT is enabled, got TTT_CHUNK_TOKENS={h.ttt_chunk_tokens}, EVAL_SEQ_LEN={h.eval_seq_len}"
+        )
     if any(d <= 0 for d in h.recur_depth_evals):
         raise ValueError(f"RECUR_DEPTH_EVALS must be positive, got {h.recur_depth_evals}")
     for d in h.recur_depth_evals:
