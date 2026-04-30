@@ -86,6 +86,11 @@ class Hyperparameters:
         for d in os.environ.get("RECUR_DEPTH_EVALS", str(recur_depth_eval)).split(",")
         if d.strip()
     )
+    recur_depth_sample_probs = tuple(
+        float(p)
+        for p in os.environ.get("RECUR_DEPTH_SAMPLE_PROBS", "").split(",")
+        if p.strip()
+    )
     recur_carry_init = float(os.environ.get("RECUR_CARRY_INIT", 0.99))
     recur_input_scale_init = float(os.environ.get("RECUR_INPUT_SCALE_INIT", 0.01))
     recur_h0_from_encoded = bool(int(os.environ.get("RECUR_H0_FROM_ENCODED", "1")))
@@ -1002,10 +1007,10 @@ def dequantize_mixed(result, meta, template_sd):
             continue
         q, s = result[name + ".q"], result[name + ".scale"]
         if s.ndim > 0:
-            scale = s.float().view(q.shape[0], *[1] * (q.ndim - 1))
-            out[name] = (q.float() * scale).to(orig_dtype)
+            W = q.float() * s.float().view(q.shape[0], *[1] * (q.ndim - 1))
         else:
-            out[name] = (q.float() * float(s.item())).to(orig_dtype)
+            W = q.float() * float(s.item())
+        out[name] = W.to(orig_dtype)
     return out
 
 
@@ -1443,19 +1448,48 @@ def train_model(h, device, val_data):
 
     depth_options = list(base_model.recur_depths)
     depth_options_tensor = torch.tensor(depth_options, dtype=torch.int64, device=device)
+    depth_probs_tensor = None
+    if len(h.recur_depth_sample_probs) > 0:
+        probs = torch.tensor(
+            h.recur_depth_sample_probs, dtype=torch.float64, device=device
+        )
+        depth_probs_tensor = probs / probs.sum()
+        expected_depth = float(
+            torch.dot(
+                torch.tensor(depth_options, dtype=torch.float64, device=device),
+                depth_probs_tensor,
+            ).item()
+        )
+        log(
+            f"recur_depth_sampling_probs: probs={[float(p) for p in depth_probs_tensor.cpu().tolist()]} expected_depth={expected_depth:.4f}"
+        )
+    else:
+        uniform_prob = 1.0 / max(len(depth_options), 1)
+        expected_depth = sum(depth_options) / max(len(depth_options), 1)
+        log(
+            f"recur_depth_sampling_probs: uniform_prob={uniform_prob:.4f} expected_depth={expected_depth:.4f}"
+        )
     depth_rng = torch.Generator(device=device)
     depth_rng.manual_seed(h.seed)
     depth_buf = torch.zeros(h.grad_accum_steps, dtype=torch.int64, device=device)
 
     def sample_step_depths():
         if h.is_main_process:
-            idx = torch.randint(
-                len(depth_options),
-                (h.grad_accum_steps,),
-                device=device,
-                generator=depth_rng,
-                dtype=torch.int64,
-            )
+            if depth_probs_tensor is None:
+                idx = torch.randint(
+                    len(depth_options),
+                    (h.grad_accum_steps,),
+                    device=device,
+                    generator=depth_rng,
+                    dtype=torch.int64,
+                )
+            else:
+                idx = torch.multinomial(
+                    depth_probs_tensor,
+                    h.grad_accum_steps,
+                    replacement=True,
+                    generator=depth_rng,
+                )
             depth_buf.copy_(depth_options_tensor[idx])
         if h.distributed:
             dist.broadcast(depth_buf, src=0)
@@ -1703,6 +1737,19 @@ def main():
         )
     if any(d <= 0 for d in h.recur_depths):
         raise ValueError(f"RECUR_DEPTHS must be positive, got {h.recur_depths}")
+    if len(h.recur_depth_sample_probs) > 0:
+        if len(h.recur_depth_sample_probs) != len(h.recur_depths):
+            raise ValueError(
+                f"RECUR_DEPTH_SAMPLE_PROBS length must match RECUR_DEPTHS; got probs={h.recur_depth_sample_probs}, depths={h.recur_depths}"
+            )
+        if any(p < 0.0 for p in h.recur_depth_sample_probs):
+            raise ValueError(
+                f"RECUR_DEPTH_SAMPLE_PROBS must be non-negative, got {h.recur_depth_sample_probs}"
+            )
+        if sum(h.recur_depth_sample_probs) <= 0.0:
+            raise ValueError(
+                f"RECUR_DEPTH_SAMPLE_PROBS sum must be > 0, got {h.recur_depth_sample_probs}"
+            )
     if not (0.0 < h.recur_carry_init < 1.0):
         raise ValueError(
             f"RECUR_CARRY_INIT must be in (0, 1), got {h.recur_carry_init}"
